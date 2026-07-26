@@ -99,6 +99,64 @@ class LoggingConfig(BaseModel):
     format: Literal["json", "text"] = Field(default="json", description="Log format")
 
 
+class S3StorageConfig(BaseModel):
+    """S3 / MinIO storage configuration."""
+
+    endpoint_url: str = Field(
+        default="http://localhost:9000",
+        description="S3/MinIO endpoint URL",
+    )
+    access_key_id: str = Field(
+        default="minioadmin",
+        description="Access key (AWS access key ID)",
+    )
+    secret_access_key: str = Field(
+        default="minioadmin",
+        description="Secret access key",
+    )
+    bucket: str = Field(
+        default="sbobinator",
+        description="Default S3 bucket name",
+    )
+    region: str = Field(
+        default="us-east-1",
+        description="AWS region (ignored by most MinIO setups)",
+    )
+    secure: bool = Field(
+        default=False,
+        description="Use HTTPS (True) or HTTP (False)",
+    )
+    max_retries: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="Maximum retry attempts for failed requests",
+    )
+    timeout: int = Field(
+        default=120,
+        ge=1,
+        le=600,
+        description="Request timeout in seconds",
+    )
+    max_audio_size: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1,
+        description="Maximum audio file size in bytes (default 2 GB)",
+    )
+    upload_transcripts: bool = Field(
+        default=True,
+        description="Upload completed transcripts back to S3",
+    )
+    transcripts_bucket: str = Field(
+        default="sbobinator-transcripts",
+        description="S3 bucket for storing transcript outputs",
+    )
+    transcripts_prefix: str = Field(
+        default="transcripts/",
+        description="S3 prefix for transcript objects",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main Settings
 # ---------------------------------------------------------------------------
@@ -163,6 +221,11 @@ class Settings(BaseSettings):
     # Logging
     # -----------------------------------------------------------------------
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    # -----------------------------------------------------------------------
+    # S3 / MinIO Storage
+    # -----------------------------------------------------------------------
+    storage: S3StorageConfig = Field(default_factory=S3StorageConfig)
 
     # -----------------------------------------------------------------------
     # Validators
@@ -270,11 +333,24 @@ class Settings(BaseSettings):
             f"║  Save:      {'ON' if self.output.save_transcripts else 'OFF':>26} ║",
             f"║  Dir:       {str(self.output.transcripts_dir):>26} ║",
             "╠──────────────────────────────────────────────────────────╣",
+            f"║  Endpoint:  {self.storage.endpoint_url:>26} ║",
+            f"║  Bucket:    {self.storage.bucket:>26} ║",
+            f"║  Region:    {self.storage.region:>26} ║",
+            f"║  Secure:    {'HTTPS' if self.storage.secure else 'HTTP':>26} ║",
+            "╠──────────────────────────────────────────────────────────╣",
             f"║  Log Level: {self.logging.level:>26} ║",
             f"║  Log Format:{self.logging.format:>26} ║",
             "╚══════════════════════════════════════════════════════════╝",
         ]
         return "\n".join(lines)
+
+    @property
+    def storage_endpoint(self) -> str:
+        """Build the full storage endpoint URL with scheme."""
+        if self.storage.endpoint_url.startswith(("http://", "https://")):
+            return self.storage.endpoint_url
+        scheme = "https" if self.storage.secure else "http"
+        return f"{scheme}://{self.storage.endpoint_url}"
 
     def model_dump_env(self) -> dict[str, str]:
         """Export all settings as flat key-value pairs suitable for .env files."""

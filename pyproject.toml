@@ -11,5 +11,7 @@ dependencies = [
     "ffmpeg-python>=0.2.0",
     "noisereduce>=3.0.3",
     "numpy>=2.5.1",
+    "scipy>=1.14.0",
     "pydantic-settings>=2.14.2",
+    "boto3>=1.36.0",
 ]
