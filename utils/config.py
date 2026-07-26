@@ -26,12 +26,19 @@ class CorsConfig(BaseModel):
 class WhisperInferenceConfig(BaseModel):
     """Whisper inference parameters."""
 
+    bip: bool = Field(default=True, description="Use BatchedInferencePipeline (True) or custom chunking pipeline (False)")
     beam_size: int = Field(default=5, ge=1, le=20, description="Beam search size")
     patience: float = Field(default=1.0, ge=0.1, le=10.0, description="Beam search patience")
     temperature: float = Field(
         default=0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0 = greedy)"
     )
-    num_workers: int = Field(default=1, ge=0, le=8, description="Number of parallel workers")
+    num_workers: int = Field(default=1, ge=0, le=8, description="Number of parallel workers (custom pipeline only)")
+    batch_size: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description="Batch size for BatchedInferencePipeline",
+    )
 
 
 class WhisperConstraintsConfig(BaseModel):
