@@ -1,7 +1,4 @@
-"""Centralized configuration for the sbobinator service.
-
-Loads and validates all settings from .env.local using pydantic-settings.
-"""
+"""Centralized configuration for the sbobinator service."""
 
 from __future__ import annotations
 
