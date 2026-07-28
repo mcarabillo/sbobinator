@@ -20,6 +20,8 @@ dependencies = [
     "pytest-cov>=7.1.0",
     "coverage>=7.15.2",
     "ruff>=0.16.0",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "nvidia-cudnn-cu12>=9.24.0.43",
 ]
 
 [project.optional-dependencies]
