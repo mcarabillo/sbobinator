@@ -44,11 +44,11 @@ class AudioFetchResult:
 class StorageBackend(Protocol):
     """Protocol for storage backends.
 
-    Implementations must provide ``fetch`` which downloads audio data
-    from a given S3 key and returns an ``AudioFetchResult``.
+    Implementations must provide ``fetch`` and ``upload``.
     """
 
     def fetch(self, key: str, bucket: str | None = None) -> AudioFetchResult: ...  # noqa: D102
+    def upload(self, key: str, data: bytes, content_type: str, bucket: str | None = None) -> None: ...  # noqa: D102
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +153,54 @@ class S3StorageBackend:
                 "and S3_STORAGE__SECRET_ACCESS_KEY."
             ) from None
 
+    def upload(
+        self,
+        key: str,
+        data: bytes,
+        content_type: str,
+        bucket: str | None = None,
+    ) -> None:
+        """Upload data to S3 / MinIO.
+
+        Parameters
+        ----------
+        key:
+            S3 object key (e.g. ``"audio/uploads/file.mp3"``).
+        data:
+            Raw file bytes.
+        content_type:
+            MIME type for the object.
+        bucket:
+            Override the default bucket from config.
+
+        Raises
+        ------
+        FetchError
+            If the upload fails (permission denied, etc.).
+        """
+        bucket = bucket or self.config.bucket
+
+        logger.info("Uploading %d bytes to s3://%s/%s [%s]", len(data), bucket, key, content_type)
+
+        try:
+            self._client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+            logger.info("Upload complete: s3://%s/%s", bucket, key)
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code in ("AccessDenied", "403"):
+                raise FetchError(f"Access denied to s3://{bucket}/{key}") from exc
+            raise FetchError(f"S3 upload error ({error_code}): {exc}") from exc
+        except NoCredentialsError:
+            raise FetchError(
+                "AWS credentials not found. Check S3_STORAGE__ACCESS_KEY_ID "
+                "and S3_STORAGE__SECRET_ACCESS_KEY."
+            ) from None
+
 
 # ---------------------------------------------------------------------------
 # Pipeline-level fetcher
@@ -189,6 +237,33 @@ class AudioFetcher:
             Override the default bucket.
         """
         return self.backend.fetch(key, bucket=bucket or self.default_bucket)
+
+    def upload(
+        self,
+        key: str,
+        data: bytes,
+        content_type: str,
+        bucket: str | None = None,
+    ) -> None:
+        """Upload data to S3 / MinIO.
+
+        Parameters
+        ----------
+        key:
+            S3 object key.
+        data:
+            Raw file bytes.
+        content_type:
+            MIME type for the object.
+        bucket:
+            Override the default bucket.
+        """
+        self.backend.upload(
+            key=key,
+            data=data,
+            content_type=content_type,
+            bucket=bucket or self.default_bucket,
+        )
 
 
 # ---------------------------------------------------------------------------

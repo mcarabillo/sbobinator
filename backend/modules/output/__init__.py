@@ -1,1 +1,5 @@
-"""Output formatting and saving module."""
+"""Transcription output formatting package."""
+
+from backend.modules.output.formatter import OutputFormatter
+
+__all__ = ["OutputFormatter"]
