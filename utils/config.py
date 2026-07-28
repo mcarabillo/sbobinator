@@ -110,8 +110,21 @@ class LoggingConfig(BaseModel):
     format: Literal["json", "text"] = Field(default="json", description="Log format")
 
 
+class TempConfig(BaseModel):
+    """Temporary file storage configuration."""
+
+    dir: Path = Field(
+        default=Path("/tmp/sbobinator"),
+        description="Directory for temporary files (audio + transcription output)",
+    )
+    cleanup_on_ack: bool = Field(
+        default=True,
+        description="Delete temp files after ACK",
+    )
+
+
 class S3StorageConfig(BaseModel):
-    """S3 / MinIO storage configuration."""
+    """S3 / MinIO storage configuration (kept for backward compatibility)."""
 
     endpoint_url: str = Field(
         default="http://localhost:9000",
@@ -153,18 +166,6 @@ class S3StorageConfig(BaseModel):
         default=2 * 1024 * 1024 * 1024,
         ge=1,
         description="Maximum audio file size in bytes (default 2 GB)",
-    )
-    upload_transcripts: bool = Field(
-        default=True,
-        description="Upload completed transcripts back to S3",
-    )
-    transcripts_bucket: str = Field(
-        default="sbobinator-transcripts",
-        description="S3 bucket for storing transcript outputs",
-    )
-    transcripts_prefix: str = Field(
-        default="transcripts/",
-        description="S3 prefix for transcript objects",
     )
 
 
@@ -232,6 +233,11 @@ class Settings(BaseSettings):
     # Logging
     # -----------------------------------------------------------------------
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    # -----------------------------------------------------------------------
+    # Temporary Files
+    # -----------------------------------------------------------------------
+    temp: TempConfig = Field(default_factory=TempConfig)
 
     # -----------------------------------------------------------------------
     # S3 / MinIO Storage
@@ -344,6 +350,7 @@ class Settings(BaseSettings):
             f"║  Save:      {'ON' if self.output.save_transcripts else 'OFF':>26} ║",
             f"║  Dir:       {str(self.output.transcripts_dir):>26} ║",
             "╠──────────────────────────────────────────────────────────╣",
+            f"║  Temp Dir:  {str(self.temp.dir):>26} ║",
             f"║  Endpoint:  {self.storage.endpoint_url:>26} ║",
             f"║  Bucket:    {self.storage.bucket:>26} ║",
             f"║  Region:    {self.storage.region:>26} ║",

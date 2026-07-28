@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -13,7 +14,7 @@ from backend.transcription_pipeline import (
     TaskInfo,
     TaskStatus,
     TranscriptionPipeline,
-    UploadResult,
+    UploadTaskResult,
 )
 
 
@@ -30,12 +31,6 @@ def _create_test_wav_bytes(duration_sec=1.0, sr=16000):
     sf.write(buf, data, sr, format="WAV", subtype="FLOAT")
     buf.seek(0)
     return buf.read()
-
-
-def _wav_bytes_utf8():
-    """Generate WAV bytes that decode as valid UTF-8 text."""
-    # WAV files won't decode as UTF-8, so we use plain text bytes
-    return b"Transcription output text"
 
 
 # ---------------------------------------------------------------------------
@@ -74,96 +69,139 @@ class TestSingleton:
 
 
 class TestUploadAudio:
-    def test_upload_audio(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test uploading audio to S3/MinIO."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            result = pipeline_instance.upload_audio(
-                file_bytes=_create_test_wav_bytes(),
-                content_type="audio/wav",
-                bucket="test-bucket",
-                destination="audio/uploads/test.wav",
-            )
+    def test_upload_audio(self, pipeline_instance):
+        """Test uploading audio creates temp file and returns task_id."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
 
-        assert isinstance(result, UploadResult)
-        assert result.key == "audio/uploads/test.wav"
-        assert result.bucket == "test-bucket"
-        assert result.size_bytes > 0
+        assert isinstance(result, UploadTaskResult)
+        assert result.task_id is not None
+        assert result.status == "processing"
+        assert result.filename == "test.wav"
         assert result.content_type == "audio/wav"
-        assert result.uploaded_at is not None
+        assert result.size_bytes == len(wav_bytes)
 
-    def test_upload_audio_auto_key(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test auto-generated key when destination not provided."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            result = pipeline_instance.upload_audio(
-                file_bytes=_create_test_wav_bytes(),
-                content_type="audio/wav",
-            )
+    def test_upload_audio_creates_temp_file(self, pipeline_instance):
+        """Test that upload creates a temporary audio file on disk."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
 
-        assert result.key.startswith("audio/uploads/")
-        assert result.bucket == "sbobinator"
+        task = pipeline_instance._get_task(result.task_id)
+        assert len(task.temp_files) == 1
+        assert task.temp_files[0].exists()
 
-    def test_upload_audio_auto_key_with_ext(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test auto-generated key with content_type that has an extension-like suffix."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            result = pipeline_instance.upload_audio(
-                file_bytes=_create_test_wav_bytes(),
-                content_type="audio/x-wav",
-            )
+    def test_upload_audio_auto_extension(self, pipeline_instance):
+        """Test that extension is guessed from content_type."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/mpeg",
+            filename="podcast",  # no extension
+        )
 
-        assert result.key.startswith("audio/uploads/")
+        task = pipeline_instance._get_task(result.task_id)
+        assert task.temp_files[0].suffix == ".mp3"
 
-    def test_upload_audio_custom_bucket(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test upload to custom bucket."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            result = pipeline_instance.upload_audio(
-                file_bytes=_create_test_wav_bytes(),
-                content_type="audio/flac",
-                bucket="custom-bucket",
-            )
+    def test_upload_audio_from_filename_extension(self, pipeline_instance):
+        """Test that extension is guessed from filename when content_type is generic."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="application/octet-stream",
+            filename="recording.flac",
+        )
 
-        assert result.bucket == "custom-bucket"
+        task = pipeline_instance._get_task(result.task_id)
+        assert task.temp_files[0].suffix == ".flac"
+
+    def test_upload_audio_starts_processing(self, pipeline_instance):
+        """Test that upload starts processing immediately."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+
+        info = pipeline_instance.get_task_status(result.task_id)
+        assert info.status == TaskStatus.PROCESSING.value
+        assert info.started_at is not None
+
+    def test_upload_audio_no_s3_dependency(self, pipeline_instance):
+        """Test that upload does NOT depend on S3/MinIO."""
+        wav_bytes = _create_test_wav_bytes()
+
+        # This should NOT raise even without S3 credentials
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+
+        assert result.task_id is not None
 
 
 # ---------------------------------------------------------------------------
-# start_conversion / task lifecycle
+# convert_task (format setting)
+# ---------------------------------------------------------------------------
+
+
+class TestConvertTask:
+    def test_convert_task_sets_format(self, pipeline_instance):
+        """Test setting output format on an existing task."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+
+        pipeline_instance.convert_task(
+            task_id=result.task_id,
+            output_format="json",
+        )
+
+        task = pipeline_instance._get_task(result.task_id)
+        assert task.output_format == "json"
+
+    def test_convert_task_not_found(self, pipeline_instance):
+        """Test setting format on non-existent task raises KeyError."""
+        with pytest.raises(KeyError, match="Task not found"):
+            pipeline_instance.convert_task(
+                task_id="nonexistent",
+                output_format="srt",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Task lifecycle
 # ---------------------------------------------------------------------------
 
 
 class TestTaskLifecycle:
-    def test_start_conversion_creates_task(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test that start_conversion creates a task and returns a task_id."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav",
-                bucket="test-bucket",
-                output_format="txt",
-            )
+    def test_get_task_status(self, pipeline_instance):
+        """Test getting task status."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
 
-        assert isinstance(task_id, str)
-        assert len(task_id) == 32  # hex UUID
-
-    def test_get_task_status_pending(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test task status is PENDING after creation."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
-
-        info = pipeline_instance.get_task_status(task_id)
+        info = pipeline_instance.get_task_status(result.task_id)
         assert isinstance(info, TaskInfo)
-        assert info.task_id == task_id
-        assert info.status == TaskStatus.PENDING.value
-        assert info.progress == 0.0
-        assert info.key == "audio/test.wav"
-        assert info.bucket == "test-bucket"
+        assert info.task_id == result.task_id
+        assert info.status == TaskStatus.PROCESSING.value
+        assert info.progress >= 0.1  # progress may have advanced due to background thread
+        assert info.filename == "test.wav"
 
     def test_get_task_not_found(self, pipeline_instance):
         """Test KeyError for non-existent task."""
@@ -175,89 +213,56 @@ class TestTaskLifecycle:
         tasks = pipeline_instance.list_tasks()
         assert tasks == []
 
-    def test_list_tasks_after_creation(self, pipeline_instance, mock_s3_client, mock_boto3_session):
+    def test_list_tasks_after_creation(self, pipeline_instance):
         """Test list_tasks returns tasks after creation."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            pipeline_instance.start_conversion(key="audio/test.wav", bucket="test-bucket")
-            pipeline_instance.start_conversion(key="audio/test2.wav", bucket="test-bucket")
+        wav_bytes = _create_test_wav_bytes()
+        pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test1.wav",
+        )
+        pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test2.wav",
+        )
 
         tasks = pipeline_instance.list_tasks()
         assert len(tasks) == 2
 
-    def test_cancel_task(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test cancelling a pending task."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
+    def test_task_info_has_no_s3_fields(self, pipeline_instance):
+        """Test that TaskInfo does not contain S3 fields."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
 
-        info = pipeline_instance.cancel_task(task_id)
-        assert info.status == TaskStatus.CANCELLED.value
-        assert info.completed_at is not None
-
-    def test_cancel_completed_task(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test cancelling an already completed task returns same status."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
-
-        # Manually set to completed
-        task = pipeline_instance._get_task(task_id)
-        task.status = TaskStatus.COMPLETED
-
-        info = pipeline_instance.cancel_task(task_id)
-        assert info.status == TaskStatus.COMPLETED.value  # unchanged
-
-    def test_cancel_nonexistent_task(self, pipeline_instance):
-        """Test cancelling a non-existent task raises KeyError."""
-        with pytest.raises(KeyError, match="Task not found"):
-            pipeline_instance.cancel_task("nonexistent")
+        info = pipeline_instance.get_task_status(result.task_id)
+        assert not hasattr(info, "key")
+        assert not hasattr(info, "bucket")
+        assert not hasattr(info, "output_key")
 
 
 # ---------------------------------------------------------------------------
-# process_task — happy path (mocked Whisper + S3)
+# process_task — happy path (mocked Whisper)
 # ---------------------------------------------------------------------------
 
 
 class TestProcessTask:
-    def test_process_task_completed(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test that process_task transitions from PENDING → COMPLETED."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
+    def test_process_task_completed(self, pipeline_instance):
+        """Test that process_task transitions PROCESSING → COMPLETED."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
 
-        # Patch the module-level imports used by process_task
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher, \
-             patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
-             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine, \
-             patch("backend.transcription_pipeline.OutputFormatter") as MockFormatter:
-
-            # Setup fetcher mock
-            fetcher_inst = MockFetcher.return_value
-            fetcher_inst.fetch.return_value = MagicMock(
-                key="audio/test.wav",
-                data=_create_test_wav_bytes(),
-                content_type="audio/wav",
-                size_bytes=32004,
-            )
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
 
             # Setup processor mock
             processor_inst = MockProcessor.return_value
@@ -279,12 +284,6 @@ class TestProcessTask:
                 language="it",
             )
 
-            # Setup formatter mock
-            formatter_inst = MockFormatter.return_value
-            formatter_inst.format.return_value = "Test segment Second segment"
-            formatter_inst.build_output_key.return_value = "audio/test.txt"
-            formatter_inst.get_mime_type.return_value = "text/plain"
-
             pipeline_instance.process_task(task_id)
 
         # Verify task completed
@@ -293,7 +292,6 @@ class TestProcessTask:
         assert info.progress == 1.0
         assert info.started_at is not None
         assert info.completed_at is not None
-        assert info.output_key == "audio/test.txt"
         assert info.duration == 1.0
         assert info.sample_rate == 16000
         assert info.original_format == "wav"
@@ -302,41 +300,25 @@ class TestProcessTask:
         assert info.segment_count == 2
         assert info.processing_time_ms is not None
 
-    def test_process_task_with_formatter(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test process_task with formatter enabled."""
-        from backend import transcription_pipeline
-        transcription_pipeline.TranscriptionPipeline._instance = None
+    def test_process_task_creates_output_temp_file(self, pipeline_instance):
+        """Test that process_task creates a second temp file for output."""
+        wav_bytes = _create_test_wav_bytes()
 
-        # Patch settings BEFORE creating the instance so _use_formatter is True
-        with patch("utils.config.settings") as mock_settings:
-            mock_cfg = MagicMock()
-            mock_cfg.output.use_formatter = True
-            mock_cfg.output.format = "srt"
-            mock_cfg.storage.bucket = "test-bucket"
-            mock_settings.return_value = mock_cfg
+        # Patch threading to prevent background thread from starting
+        with patch("threading.Thread") as MockThread:
+            mock_thread = MagicMock()
+            MockThread.return_value = mock_thread
 
-            # Re-create pipeline instance with patched settings
-            formatter_pipeline = TranscriptionPipeline.get_instance()
-            formatter_pipeline._use_formatter = True  # Force formatter mode
-            formatter_pipeline._output_format = "srt"
-
-            with patch("boto3.Session", return_value=mock_boto3_session):
-                task_id = formatter_pipeline.start_conversion(
-                    key="audio/test.wav", bucket="test-bucket", output_format="srt"
-                )
-
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher, \
-             patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
-             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine, \
-             patch("backend.transcription_pipeline.OutputFormatter") as MockFormatter:
-
-            fetcher_inst = MockFetcher.return_value
-            fetcher_inst.fetch.return_value = MagicMock(
-                key="audio/test.wav",
-                data=_create_test_wav_bytes(),
+            result = pipeline_instance.upload_audio(
+                file_bytes=wav_bytes,
                 content_type="audio/wav",
-                size_bytes=32004,
+                filename="test.wav",
             )
+            task_id = result.task_id
+
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
+
             processor_inst = MockProcessor.return_value
             processor_inst.process.return_value = MagicMock(
                 data=np.random.randn(16000).astype(np.float32),
@@ -345,25 +327,74 @@ class TestProcessTask:
                 original_format="wav",
                 original_sample_rate=16000,
             )
-            seg1 = MagicMock(start=0.0, end=1.0, text="Test")
+
+            seg = MagicMock(start=0.0, end=1.0, text="Test")
             engine_inst = MockEngine.return_value
             engine_inst.transcribe.return_value = MagicMock(
-                segments=[seg1], text="Test", language="it"
+                segments=[seg], text="Test", language="it",
             )
+
+            pipeline_instance.process_task(task_id)
+
+        task = pipeline_instance._get_task(task_id)
+        assert len(task.temp_files) == 2  # audio + output
+        assert task.temp_files[1].exists()
+
+    def test_process_task_with_formatter(self, pipeline_instance):
+        """Test process_task with formatter enabled."""
+        from backend import transcription_pipeline
+        transcription_pipeline.TranscriptionPipeline._instance = None
+
+        with patch("utils.config.settings") as mock_settings:
+            mock_cfg = MagicMock()
+            mock_cfg.output.use_formatter = True
+            mock_cfg.output.format = "srt"
+            mock_cfg.temp.dir = "/tmp/sbobinator_test"
+            mock_settings.return_value = mock_cfg
+
+            formatter_pipeline = TranscriptionPipeline.get_instance()
+            formatter_pipeline._use_formatter = True
+            formatter_pipeline._output_format = "srt"
+
+            wav_bytes = _create_test_wav_bytes()
+            result = formatter_pipeline.upload_audio(
+                file_bytes=wav_bytes,
+                content_type="audio/wav",
+                filename="test.wav",
+            )
+            formatter_pipeline.convert_task(result.task_id, "srt")
+            task_id = result.task_id
+
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine, \
+             patch("backend.transcription_pipeline.OutputFormatter") as MockFormatter:
+
+            processor_inst = MockProcessor.return_value
+            processor_inst.process.return_value = MagicMock(
+                data=np.random.randn(16000).astype(np.float32),
+                sample_rate=16000,
+                duration=1.0,
+                original_format="wav",
+                original_sample_rate=16000,
+            )
+
+            seg = MagicMock(start=0.0, end=1.0, text="Test")
+            engine_inst = MockEngine.return_value
+            engine_inst.transcribe.return_value = MagicMock(
+                segments=[seg], text="Test", language="it",
+            )
+
             formatter_inst = MockFormatter.return_value
             formatter_inst.format.return_value = "1\n00:00:00,000 --> 00:00:01,000\nTest"
-            formatter_inst.build_output_key.return_value = "audio/test.srt"
+            formatter_inst.get_extension.return_value = ".srt"
             formatter_inst.get_mime_type.return_value = "text/srt"
 
             formatter_pipeline.process_task(task_id)
 
         info = formatter_pipeline.get_task_status(task_id)
         assert info.status == TaskStatus.COMPLETED.value
-        # The formatter mock's build_output_key should have been called
-        formatter_inst.build_output_key.assert_called_once()
-        assert info.output_key == "audio/test.srt"
 
-    def test_process_task_raw_text_mode(self, pipeline_instance, mock_s3_client, mock_boto3_session):
+    def test_process_task_raw_text_mode(self, pipeline_instance):
         """Test process_task in raw text mode (formatter disabled)."""
         from backend import transcription_pipeline
         transcription_pipeline.TranscriptionPipeline._instance = None
@@ -372,25 +403,24 @@ class TestProcessTask:
             mock_cfg = MagicMock()
             mock_cfg.output.use_formatter = False
             mock_cfg.output.format = "json"
-            mock_cfg.storage.bucket = "test-bucket"
+            mock_cfg.temp.dir = "/tmp/sbobinator_test"
             mock_settings.return_value = mock_cfg
 
-            with patch("boto3.Session", return_value=mock_boto3_session):
-                task_id = pipeline_instance.start_conversion(
-                    key="audio/test.wav", bucket="test-bucket"
-                )
+            pipeline_instance = TranscriptionPipeline.get_instance()
+            pipeline_instance._use_formatter = False
+            pipeline_instance._output_format = "json"
 
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher, \
-             patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+            wav_bytes = _create_test_wav_bytes()
+            result = pipeline_instance.upload_audio(
+                file_bytes=wav_bytes,
+                content_type="audio/wav",
+                filename="test.wav",
+            )
+            task_id = result.task_id
+
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
              patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
 
-            fetcher_inst = MockFetcher.return_value
-            fetcher_inst.fetch.return_value = MagicMock(
-                key="audio/test.wav",
-                data=_create_test_wav_bytes(),
-                content_type="audio/wav",
-                size_bytes=32004,
-            )
             processor_inst = MockProcessor.return_value
             processor_inst.process.return_value = MagicMock(
                 data=np.random.randn(16000).astype(np.float32),
@@ -399,17 +429,17 @@ class TestProcessTask:
                 original_format="wav",
                 original_sample_rate=16000,
             )
-            seg1 = MagicMock(start=0.0, end=1.0, text="Raw text")
+
+            seg = MagicMock(start=0.0, end=1.0, text="Raw text")
             engine_inst = MockEngine.return_value
             engine_inst.transcribe.return_value = MagicMock(
-                segments=[seg1], text="Raw text", language="it"
+                segments=[seg], text="Raw text", language="it",
             )
 
             pipeline_instance.process_task(task_id)
 
         info = pipeline_instance.get_task_status(task_id)
         assert info.status == TaskStatus.COMPLETED.value
-        assert info.output_key == "audio/test.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -418,57 +448,19 @@ class TestProcessTask:
 
 
 class TestProcessTaskErrors:
-    def test_fetch_error(self, pipeline_instance):
-        """Test that FetchError marks task as FAILED."""
-        from backend.modules.storage.fetcher import FetchError
-
-        # Create task directly (skip start_conversion which calls real S3)
-        task_id = pipeline_instance.start_conversion.__wrapped__(
-            pipeline_instance, "audio/test.wav", "test-bucket"
-        ) if hasattr(pipeline_instance.start_conversion, '__wrapped__') else None
-
-        if task_id is None:
-            # Manually create the task
-            import uuid
-            task_id = uuid.uuid4().hex
-            from backend.transcription_pipeline import _ConversionTask
-            task = _ConversionTask(
-                task_id=task_id,
-                key="audio/test.wav",
-                bucket="test-bucket",
-            )
-            pipeline_instance._set_task(task)
-
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher:
-            MockFetcher.return_value.fetch.side_effect = FetchError("File not found")
-            pipeline_instance.process_task(task_id)
-
-        info = pipeline_instance.get_task_status(task_id)
-        assert info.status == TaskStatus.FAILED.value
-        assert "Fetch error" in info.error
-
-    def test_audio_processing_error(self, pipeline_instance, mock_s3_client, mock_boto3_session):
+    def test_audio_processing_error(self, pipeline_instance):
         """Test that AudioProcessingError marks task as FAILED."""
         from backend.modules.preprocessing.audio_processor import AudioProcessingError
 
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
 
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher, \
-             patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor:
-
-            MockFetcher.return_value.fetch.return_value = MagicMock(
-                key="audio/test.wav",
-                data=_create_test_wav_bytes(),
-                content_type="audio/wav",
-                size_bytes=32004,
-            )
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor:
             MockProcessor.return_value.process.side_effect = AudioProcessingError("Decode failed")
             pipeline_instance.process_task(task_id)
 
@@ -476,29 +468,21 @@ class TestProcessTaskErrors:
         assert info.status == TaskStatus.FAILED.value
         assert "Processing error" in info.error
 
-    def test_transcription_error(self, pipeline_instance, mock_s3_client, mock_boto3_session):
+    def test_transcription_error(self, pipeline_instance):
         """Test that TranscriptionError marks task as FAILED."""
         from backend.modules.transcription.whisper_engine import TranscriptionError
 
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
 
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher, \
-             patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
              patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
 
-            MockFetcher.return_value.fetch.return_value = MagicMock(
-                key="audio/test.wav",
-                data=_create_test_wav_bytes(),
-                content_type="audio/wav",
-                size_bytes=32004,
-            )
             MockProcessor.return_value.process.return_value = MagicMock(
                 data=np.random.randn(16000).astype(np.float32),
                 sample_rate=16000,
@@ -513,27 +497,19 @@ class TestProcessTaskErrors:
         assert info.status == TaskStatus.FAILED.value
         assert "Transcription error" in info.error
 
-    def test_unexpected_error(self, pipeline_instance, mock_s3_client, mock_boto3_session):
+    def test_unexpected_error(self, pipeline_instance):
         """Test that unexpected exceptions mark task as FAILED."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
 
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher, \
-             patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
              patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
 
-            MockFetcher.return_value.fetch.return_value = MagicMock(
-                key="audio/test.wav",
-                data=_create_test_wav_bytes(),
-                content_type="audio/wav",
-                size_bytes=32004,
-            )
             MockProcessor.return_value.process.return_value = MagicMock(
                 data=np.random.randn(16000).astype(np.float32),
                 sample_rate=16000,
@@ -541,31 +517,12 @@ class TestProcessTaskErrors:
                 original_format="wav",
                 original_sample_rate=16000,
             )
-            MockEngine.return_value.transcribe.side_effect = RuntimeError("Something weird happened")
+            MockEngine.return_value.transcribe.side_effect = RuntimeError("Something weird")
             pipeline_instance.process_task(task_id)
 
         info = pipeline_instance.get_task_status(task_id)
         assert info.status == TaskStatus.FAILED.value
         assert "Unexpected error" in info.error
-
-    def test_task_not_found_get_output(self, pipeline_instance):
-        """Test get_task_output raises KeyError for non-existent task."""
-        with pytest.raises(KeyError, match="Task not found"):
-            pipeline_instance.get_task_output("nonexistent")
-
-    def test_task_not_completed_get_output(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test get_task_output raises ValueError for non-completed task."""
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
-            )
-
-        with pytest.raises(ValueError, match="not completed"):
-            pipeline_instance.get_task_output(task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -574,40 +531,227 @@ class TestProcessTaskErrors:
 
 
 class TestGetTaskOutput:
-    def test_get_output_success(self, pipeline_instance, mock_s3_client, mock_boto3_session):
-        """Test successful output retrieval."""
-        from backend.modules.storage.fetcher import AudioFetchResult
+    def test_get_output_success(self, pipeline_instance):
+        """Test successful output retrieval from temp file."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
 
-        with patch("boto3.Session", return_value=mock_boto3_session):
-            mock_s3_client.get_object.return_value = {
-                "Body": MagicMock(read=lambda: _create_test_wav_bytes()),
-                "ContentType": "audio/wav",
-            }
-            task_id = pipeline_instance.start_conversion(
-                key="audio/test.wav", bucket="test-bucket"
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
+
+            processor_inst = MockProcessor.return_value
+            processor_inst.process.return_value = MagicMock(
+                data=np.random.randn(16000).astype(np.float32),
+                sample_rate=16000,
+                duration=1.0,
+                original_format="wav",
+                original_sample_rate=16000,
             )
 
-        # Manually set task to completed with output_key
+            seg = MagicMock(start=0.0, end=1.0, text="Test")
+            engine_inst = MockEngine.return_value
+            engine_inst.transcribe.return_value = MagicMock(
+                segments=[seg], text="Test", language="it",
+            )
+
+            pipeline_instance.process_task(task_id)
+
+        output = pipeline_instance.get_task_output(task_id)
+        assert output == "Test"
+
+    def test_get_output_not_completed(self, pipeline_instance):
+        """Test get_task_output raises ValueError for non-completed task."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+
+        with pytest.raises(ValueError, match="not completed"):
+            pipeline_instance.get_task_output(result.task_id)
+
+    def test_get_output_not_found(self, pipeline_instance):
+        """Test get_task_output raises KeyError for non-existent task."""
+        with pytest.raises(KeyError, match="Task not found"):
+            pipeline_instance.get_task_output("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# acknowledge_task
+# ---------------------------------------------------------------------------
+
+
+class TestAcknowledgeTask:
+    def test_acknowledge_success(self, pipeline_instance):
+        """Test successful acknowledgment cleans up temp files."""
+        wav_bytes = _create_test_wav_bytes()
+
+        # Patch threading to prevent background thread from starting
+        with patch("threading.Thread") as MockThread:
+            mock_thread = MagicMock()
+            MockThread.return_value = mock_thread
+
+            result = pipeline_instance.upload_audio(
+                file_bytes=wav_bytes,
+                content_type="audio/wav",
+                filename="test.wav",
+            )
+            task_id = result.task_id
+
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
+
+            processor_inst = MockProcessor.return_value
+            processor_inst.process.return_value = MagicMock(
+                data=np.random.randn(16000).astype(np.float32),
+                sample_rate=16000,
+                duration=1.0,
+                original_format="wav",
+                original_sample_rate=16000,
+            )
+
+            seg = MagicMock(start=0.0, end=1.0, text="Test")
+            engine_inst = MockEngine.return_value
+            engine_inst.transcribe.return_value = MagicMock(
+                segments=[seg], text="Test", language="it",
+            )
+
+            pipeline_instance.process_task(task_id)
+
+        # Verify temp files exist before ACK (1 audio + 1 output)
+        task = pipeline_instance._get_task(task_id)
+        assert len(task.temp_files) == 2
+        assert all(f.exists() for f in task.temp_files)
+
+        # Acknowledge
+        pipeline_instance.acknowledge_task(task_id)
+
+        # Verify temp files are deleted
+        assert len(task.temp_files) == 0
+        assert task.acknowledged is True
+
+    def test_acknowledge_not_completed(self, pipeline_instance):
+        """Test ACK for non-completed task raises ValueError."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+
+        with pytest.raises(ValueError, match="not completed"):
+            pipeline_instance.acknowledge_task(result.task_id)
+
+    def test_acknowledge_already_acked(self, pipeline_instance):
+        """Test double ACK raises ValueError."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
+
+        with patch("backend.transcription_pipeline.AudioProcessor") as MockProcessor, \
+             patch("backend.transcription_pipeline.TranscriptionEngine") as MockEngine:
+
+            processor_inst = MockProcessor.return_value
+            processor_inst.process.return_value = MagicMock(
+                data=np.random.randn(16000).astype(np.float32),
+                sample_rate=16000,
+                duration=1.0,
+                original_format="wav",
+                original_sample_rate=16000,
+            )
+
+            seg = MagicMock(start=0.0, end=1.0, text="Test")
+            engine_inst = MockEngine.return_value
+            engine_inst.transcribe.return_value = MagicMock(
+                segments=[seg], text="Test", language="it",
+            )
+
+            pipeline_instance.process_task(task_id)
+
+        pipeline_instance.acknowledge_task(task_id)
+
+        with pytest.raises(ValueError, match="already been acknowledged"):
+            pipeline_instance.acknowledge_task(task_id)
+
+    def test_acknowledge_not_found(self, pipeline_instance):
+        """Test ACK for non-existent task raises KeyError."""
+        with pytest.raises(KeyError, match="Task not found"):
+            pipeline_instance.acknowledge_task("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# cancel_task
+# ---------------------------------------------------------------------------
+
+
+class TestCancelTask:
+    def test_cancel_success(self, pipeline_instance):
+        """Test cancelling a task."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
+
+        info = pipeline_instance.cancel_task(task_id)
+        assert info.status == TaskStatus.CANCELLED.value
+        assert info.completed_at is not None
+
+    def test_cancel_completed_task(self, pipeline_instance):
+        """Test cancelling an already completed task returns same status."""
+        wav_bytes = _create_test_wav_bytes()
+        result = pipeline_instance.upload_audio(
+            file_bytes=wav_bytes,
+            content_type="audio/wav",
+            filename="test.wav",
+        )
+        task_id = result.task_id
+
+        # Manually set to completed
         task = pipeline_instance._get_task(task_id)
         task.status = TaskStatus.COMPLETED
-        task.output_key = "audio/test.txt"
-        task.bucket = "test-bucket"
 
-        # Reset cached fetcher so the mock is used
-        pipeline_instance._audio_fetcher = None
+        info = pipeline_instance.cancel_task(task_id)
+        assert info.status == TaskStatus.COMPLETED.value
 
-        # Mock fetch for the output file - use plain text bytes (valid UTF-8)
-        with patch("backend.transcription_pipeline.AudioFetcher") as MockFetcher:
-            MockFetcher.return_value.fetch.return_value = AudioFetchResult(
-                key="audio/test.txt",
-                data=b"Transcription output text",  # Plain ASCII text, valid UTF-8
-                content_type="text/plain",
-                size_bytes=26,
-            )
-            output = pipeline_instance.get_task_output(task_id)
+    def test_cancel_nonexistent_task(self, pipeline_instance):
+        """Test cancelling a non-existent task raises KeyError."""
+        with pytest.raises(KeyError, match="Task not found"):
+            pipeline_instance.cancel_task("nonexistent")
 
-        assert output == "Transcription output text"
-        # Verify the fetcher was called with the output key
-        MockFetcher.return_value.fetch.assert_called_once_with(
-            key="audio/test.txt", bucket="test-bucket"
-        )
+
+# ---------------------------------------------------------------------------
+# _guess_extension
+# ---------------------------------------------------------------------------
+
+
+class TestGuessExtension:
+    def test_from_content_type(self, pipeline_instance):
+        """Test extension guessed from content_type."""
+        assert pipeline_instance._guess_extension("audio/wav", "anything") == "wav"
+        assert pipeline_instance._guess_extension("audio/mpeg", "anything") == "mp3"
+        assert pipeline_instance._guess_extension("audio/flac", "anything") == "flac"
+        assert pipeline_instance._guess_extension("audio/ogg", "anything") == "ogg"
+        assert pipeline_instance._guess_extension("audio/m4a", "anything") == "m4a"
+
+    def test_from_filename(self, pipeline_instance):
+        """Test extension guessed from filename when content_type is unknown."""
+        assert pipeline_instance._guess_extension("application/octet-stream", "file.mp3") == "mp3"
+        assert pipeline_instance._guess_extension("application/octet-stream", "file.wav") == "wav"
+        assert pipeline_instance._guess_extension("application/octet-stream", "file.flac") == "flac"
+
+    def test_default_fallback(self, pipeline_instance):
+        """Test default fallback to wav."""
+        assert pipeline_instance._guess_extension("application/octet-stream", "noext") == "wav"

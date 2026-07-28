@@ -10,17 +10,17 @@ Public API
 
     pipeline = TranscriptionPipeline.get_instance()
 
-    # Upload an audio file to S3/MinIO
-    result = pipeline.upload_audio(file_bytes, content_type, bucket, destination)
-
-    # Start an async transcription job
-    task_id = pipeline.start_conversion(key, bucket, output_format)
+    # Upload audio and start transcription (async, returns task_id)
+    result = pipeline.upload_audio(file_bytes, content_type, filename)
 
     # Poll task status
     info = pipeline.get_task_status(task_id)
 
     # Get the transcription output (raw text or formatted)
     output = pipeline.get_task_output(task_id)
+
+    # Acknowledge receipt (triggers temp file cleanup)
+    pipeline.acknowledge_task(task_id)
 
     # Cancel a running task
     info = pipeline.cancel_task(task_id)
@@ -33,22 +33,20 @@ Public API
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from backend.modules.output.formatter import OutputFormatter
 from backend.modules.preprocessing.audio_processor import (
     AudioProcessor,
     AudioProcessingError,
-)
-from backend.modules.storage.fetcher import (
-    AudioFetcher,
-    FetchError,
 )
 from backend.modules.transcription.whisper_engine import (
     TranscriptionEngine,
@@ -81,14 +79,14 @@ class TaskStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class UploadResult:
-    """Result of a successful audio upload."""
+class UploadTaskResult:
+    """Result of a successful audio upload (transcription started)."""
 
-    key: str
-    bucket: str
-    size_bytes: int
+    task_id: str
+    status: str
+    filename: str
     content_type: str
-    uploaded_at: datetime
+    size_bytes: int
 
 
 @dataclass
@@ -97,12 +95,11 @@ class TaskInfo:
 
     task_id: str
     status: str
-    key: str
-    bucket: str
     progress: float
     started_at: datetime | None = None
     completed_at: datetime | None = None
-    output_key: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
     duration: float | None = None
     sample_rate: int | None = None
     original_format: str | None = None
@@ -111,6 +108,7 @@ class TaskInfo:
     segment_count: int | None = None
     processing_time_ms: float | None = None
     error: str | None = None
+    acknowledged: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -124,17 +122,16 @@ class _ConversionTask:
     def __init__(
         self,
         task_id: str,
-        key: str,
-        bucket: str,
+        filename: str,
+        content_type: str,
     ) -> None:
         self.task_id = task_id
-        self.key = key
-        self.bucket = bucket
+        self.filename = filename
+        self.content_type = content_type
         self.status = TaskStatus.PENDING
         self.progress: float = 0.0
         self.started_at: datetime | None = None
         self.completed_at: datetime | None = None
-        self.output_key: str | None = None
         self.duration: float | None = None
         self.sample_rate: int | None = None
         self.original_format: str | None = None
@@ -145,18 +142,20 @@ class _ConversionTask:
         self.error: str | None = None
         self._cancelled = threading.Event()
         self.output_format: str = "txt"
+        self.acknowledged: bool = False
+        # Temporary files: [0] = audio tempfile, [1] = output tempfile
+        self.temp_files: list[Path] = []
 
     def to_info(self) -> TaskInfo:
         """Convert to an immutable TaskInfo snapshot."""
         return TaskInfo(
             task_id=self.task_id,
             status=self.status.value,
-            key=self.key,
-            bucket=self.bucket,
             progress=self.progress,
             started_at=self.started_at,
             completed_at=self.completed_at,
-            output_key=self.output_key,
+            filename=self.filename,
+            content_type=self.content_type,
             duration=self.duration,
             sample_rate=self.sample_rate,
             original_format=self.original_format,
@@ -165,6 +164,7 @@ class _ConversionTask:
             segment_count=self.segment_count,
             processing_time_ms=self.processing_time_ms,
             error=self.error,
+            acknowledged=self.acknowledged,
         )
 
 
@@ -177,11 +177,13 @@ class TranscriptionPipeline:
     """Facade for all transcription operations.
 
     Orchestrates the full pipeline:
-        1. Fetch audio from S3/MinIO
+        1. Save uploaded audio to a temporary file
         2. Preprocess audio (decode, resample, clean)
         3. Transcribe with Whisper
         4. Format output (optional, controlled by config)
-        5. Save result to S3/MinIO
+        5. Save transcription to a temporary file
+        6. Return transcription on request
+        7. Clean up temp files after ACK
 
     This is a singleton — use ``get_instance()`` to obtain the shared
     instance.
@@ -194,9 +196,10 @@ class TranscriptionPipeline:
         self._cfg = settings()
         self._use_formatter = self._cfg.output.use_formatter
         self._output_format = self._cfg.output.format
+        self._temp_dir = Path(self._cfg.temp.dir)
+        self._temp_dir.mkdir(parents=True, exist_ok=True)
 
         # Lazy-initialized modules
-        self._audio_fetcher: AudioFetcher | None = None
         self._audio_processor: AudioProcessor | None = None
         self._transcription_engine: TranscriptionEngine | None = None
         self._output_formatter: OutputFormatter | None = None
@@ -221,12 +224,6 @@ class TranscriptionPipeline:
     # ------------------------------------------------------------------
     # Lazy module initialisation
     # ------------------------------------------------------------------
-
-    @property
-    def _fetcher(self) -> AudioFetcher:
-        if self._audio_fetcher is None:
-            self._audio_fetcher = AudioFetcher()
-        return self._audio_fetcher
 
     @property
     def _processor(self) -> AudioProcessor:
@@ -271,10 +268,12 @@ class TranscriptionPipeline:
         self,
         file_bytes: bytes,
         content_type: str,
-        bucket: str | None = None,
-        destination: str | None = None,
-    ) -> UploadResult:
-        """Upload an audio file to S3/MinIO.
+        filename: str,
+    ) -> UploadTaskResult:
+        """Save uploaded audio to a temp file and start transcription.
+
+        The transcription runs asynchronously in a background thread.
+        The caller receives a ``task_id`` immediately.
 
         Parameters
         ----------
@@ -282,122 +281,119 @@ class TranscriptionPipeline:
             Raw audio file bytes.
         content_type:
             MIME type of the audio file.
-        bucket:
-            Target bucket (defaults to config).
-        destination:
-            Custom key inside the bucket. Auto-generated if not provided.
+        filename:
+            Original filename (used for extension detection).
 
         Returns
         -------
-        UploadResult
-            Metadata about the uploaded file.
+        UploadTaskResult
+            Metadata about the upload and the transcription task.
         """
-        from utils.config import settings as get_settings
+        # Determine extension from content_type or filename
+        ext = self._guess_extension(content_type, filename)
 
-        cfg = get_settings()
-        target_bucket = bucket or cfg.storage.bucket
-
-        if destination:
-            key = destination
-        else:
-            ext = Path(content_type).suffix.lstrip(".") or "audio"
-            key = f"audio/uploads/{uuid.uuid4().hex}.{ext}"
-
-        self._fetcher.upload(
-            key=key,
-            data=file_bytes,
-            content_type=content_type,
-            bucket=target_bucket,
+        # Create a real temporary file on disk (not in-memory) so the
+        # audio processor can read it with ffmpeg/soundfile.
+        tmp = NamedTemporaryFile(
+            suffix=f".{ext}",
+            dir=str(self._temp_dir),
+            delete=False,
+            prefix=f"audio_{uuid.uuid4().hex[:8]}_",
         )
-
-        logger.info("Uploaded %d bytes → s3://%s/%s", len(file_bytes), target_bucket, key)
-
-        return UploadResult(
-            key=key,
-            bucket=target_bucket,
-            size_bytes=len(file_bytes),
-            content_type=content_type,
-            uploaded_at=datetime.now(timezone.utc),
-        )
-
-    def start_conversion(
-        self,
-        key: str,
-        bucket: str | None = None,
-        output_format: str = "txt",
-    ) -> str:
-        """Start an async transcription job.
-
-        Validates that the source file exists in S3/MinIO, creates a task,
-        and returns the ``task_id`` immediately. The actual work is performed
-        by calling ``process_task(task_id)`` in a background thread.
-
-        Parameters
-        ----------
-        key:
-            S3/MinIO object key (e.g. ``'audio/uploads/file.mp3'``).
-        bucket:
-            Override the default bucket.
-        output_format:
-            Output format (``json``, ``srt``, ``vtt``, ``txt``, ``csv``,
-            ``tsv``). Only used when ``use_formatter`` is True.
-
-        Returns
-        -------
-        str
-            The ``task_id`` for this conversion job.
-        """
-        from utils.config import settings as get_settings
-
-        cfg = get_settings()
-        target_bucket = bucket or cfg.storage.bucket
-
-        # Validate: file must exist in S3/MinIO
-        self._fetcher.fetch(key=key, bucket=target_bucket)
+        tmp.write(file_bytes)
+        tmp.close()
+        audio_path = Path(tmp.name)
 
         # Create task
         task_id = uuid.uuid4().hex
         task = _ConversionTask(
             task_id=task_id,
-            key=key,
-            bucket=target_bucket,
+            filename=filename,
+            content_type=content_type,
         )
-        task.output_format = output_format
+        task.output_format = "txt"  # default, overridden by convert endpoint
+        task.temp_files = [audio_path]
+        task.status = TaskStatus.PROCESSING
+        task.started_at = datetime.now(timezone.utc)
+        task.progress = 0.1
         self._set_task(task)
 
-        logger.info("Started conversion task %s for %s", task_id, key)
+        # Start transcription in background
+        threading.Thread(
+            target=self.process_task,
+            args=(task_id,),
+            daemon=True,
+        ).start()
+
+        logger.info(
+            "Uploaded %d bytes (%s) → task=%s (audio=%s)",
+            len(file_bytes), filename, task_id, audio_path,
+        )
+
+        return UploadTaskResult(
+            task_id=task_id,
+            status=task.status.value,
+            filename=filename,
+            content_type=content_type,
+            size_bytes=len(file_bytes),
+        )
+
+    def convert_task(
+        self,
+        task_id: str,
+        output_format: str = "txt",
+    ) -> str:
+        """Set the output format for an existing task.
+
+        Must be called after ``upload_audio()`` and before the transcription
+        completes. If the task is already processing, the format is applied
+        when the task reaches the formatting step.
+
+        Parameters
+        ----------
+        task_id:
+            The task ID returned by ``upload_audio()``.
+        output_format:
+            Output format (``json``, ``srt``, ``vtt``, ``txt``, ``csv``,
+            ``tsv``).
+
+        Returns
+        -------
+        str
+            The ``task_id``.
+
+        Raises
+        ------
+        KeyError:
+            If the task doesn't exist.
+        """
+        task = self._get_task(task_id)
+        task.output_format = output_format
         return task_id
 
     def process_task(self, task_id: str) -> None:
         """Execute the full conversion pipeline for a given task.
 
-        This is the core orchestration method called by background workers.
+        This is the core orchestration method called in a background thread.
         """
         task = self._get_task(task_id)
 
         try:
-            from utils.config import settings as get_settings
-
-            cfg = get_settings()
-            target_bucket = task.bucket or cfg.storage.bucket
-
-            task.status = TaskStatus.PROCESSING
-            task.started_at = datetime.now(timezone.utc)
-            task.progress = 0.1
-
-            # --- Step 1: Fetch audio from S3/MinIO ---
-            logger.info("[%s] Fetching audio from s3://%s/%s", task_id, target_bucket, task.key)
-            fetch_result = self._fetcher.fetch(key=task.key, bucket=target_bucket)
-            task.progress = 0.3
+            # --- Step 1: Read audio from temp file ---
+            audio_path = task.temp_files[0]
+            logger.info("[%s] Reading audio from %s", task_id, audio_path)
+            with open(audio_path, "rb") as f:
+                raw_bytes = f.read()
+            task.progress = 0.2
 
             # --- Step 2: Preprocess audio ---
             logger.info("[%s] Preprocessing audio...", task_id)
             processed = self._processor.process(
-                raw_bytes=fetch_result.data,
-                content_type=fetch_result.content_type,
-                filename=fetch_result.key,
+                raw_bytes=raw_bytes,
+                content_type=task.content_type,
+                filename=task.filename,
             )
-            task.progress = 0.6
+            task.progress = 0.4
 
             # --- Step 3: Transcribe ---
             logger.info("[%s] Transcribing (%.2fs)...", task_id, processed.duration)
@@ -406,38 +402,41 @@ class TranscriptionPipeline:
                 sr=processed.sample_rate,
                 audio_duration=processed.duration,
             )
-            task.progress = 0.8
+            task.progress = 0.7
 
             # --- Step 4: Build output ---
+            fmt = task.output_format or self._output_format
             if self._use_formatter:
-                # Use OutputFormatter for formatted output
-                fmt = task.output_format or self._output_format
                 output_content = self._formatter.format(
                     segments=result.segments,
                     fmt=fmt,
                 )
-                output_key = self._formatter.build_output_key(task.key, fmt)
                 mime_type = self._formatter.get_mime_type(fmt)
             else:
-                # Raw text — no timestamps, no formatting
                 output_content = result.text
-                parts = task.key.rsplit(".", 1)
-                output_key = f"{parts[0]}.txt" if len(parts) == 2 else f"{task.key}.txt"
                 mime_type = "text/plain"
+
+            # Save output to a second temp file
+            output_ext = ".txt" if not self._use_formatter else self._formatter.get_extension(fmt)
+            output_tmp = NamedTemporaryFile(
+                suffix=output_ext,
+                dir=str(self._temp_dir),
+                delete=False,
+                mode="w",
+                encoding="utf-8",
+                prefix=f"output_{uuid.uuid4().hex[:8]}_",
+            )
+            output_tmp.write(output_content)
+            output_tmp.close()
+            output_path = Path(output_tmp.name)
+            task.temp_files.append(output_path)
+
             task.progress = 0.9
 
-            logger.info("[%s] Saving output to s3://%s/%s", task_id, target_bucket, output_key)
-            self._fetcher.upload(
-                key=output_key,
-                data=output_content.encode("utf-8"),
-                content_type=mime_type,
-                bucket=target_bucket,
-            )
-
             # --- Finalize task ---
-            elapsed_ms = (time.time() - task.started_at.timestamp()) * 1000
+            started_at = task.started_at or datetime.now(timezone.utc)
+            elapsed_ms = (time.time() - started_at.timestamp()) * 1000
 
-            task.output_key = output_key
             task.duration = processed.duration
             task.sample_rate = processed.sample_rate
             task.original_format = processed.original_format
@@ -454,15 +453,9 @@ class TranscriptionPipeline:
                 task_id,
                 len(result.segments),
                 processed.duration,
-                output_key,
+                output_path,
                 elapsed_ms,
             )
-
-        except FetchError as exc:
-            task.status = TaskStatus.FAILED
-            task.error = f"Fetch error: {exc}"
-            task.completed_at = datetime.now(timezone.utc)
-            logger.error("[%s] Fetch failed: %s", task_id, exc)
 
         except AudioProcessingError as exc:
             task.status = TaskStatus.FAILED
@@ -488,13 +481,35 @@ class TranscriptionPipeline:
             task.completed_at = datetime.now(timezone.utc)
             logger.error("[%s] Unexpected error: %s", task_id, exc, exc_info=True)
 
+    def _guess_extension(self, content_type: str, filename: str) -> str:
+        """Guess file extension from content_type or filename."""
+        # Try content_type first (e.g. "audio/mpeg" → "mp3")
+        ext_map: dict[str, str] = {
+            "audio/wav": "wav",
+            "audio/x-wav": "wav",
+            "audio/flac": "flac",
+            "audio/ogg": "ogg",
+            "audio/mp3": "mp3",
+            "audio/mpeg": "mp3",
+            "audio/m4a": "m4a",
+            "audio/mp4": "mp4",
+            "audio/webm": "webm",
+        }
+        if content_type in ext_map:
+            return ext_map[content_type]
+        # Fallback to filename extension
+        ext = Path(filename).suffix.lstrip(".").lower()
+        if ext:
+            return ext
+        return "wav"  # default fallback
+
     def get_task_status(self, task_id: str) -> TaskInfo:
         """Get the current status of a task.
 
         Parameters
         ----------
         task_id:
-            The task ID returned by ``start_conversion()``.
+            The task ID returned by ``upload_audio()``.
 
         Returns
         -------
@@ -507,10 +522,14 @@ class TranscriptionPipeline:
     def get_task_output(self, task_id: str) -> str:
         """Get the transcription output for a completed task.
 
+        The temporary files are NOT deleted here — they are deleted only
+        after the caller explicitly acknowledges receipt via
+        ``acknowledge_task()``.
+
         Parameters
         ----------
         task_id:
-            The task ID returned by ``start_conversion()``.
+            The task ID returned by ``upload_audio()``.
 
         Returns
         -------
@@ -531,15 +550,59 @@ class TranscriptionPipeline:
                 f"Task is not completed (status: {task.status.value})."
             )
 
-        if not task.output_key:
+        # Output is the second temp file
+        if len(task.temp_files) < 2:
             raise ValueError("Output file not found.")
 
-        # Fetch output file from S3/MinIO
-        fetch_result = self._fetcher.fetch(key=task.output_key, bucket=task.bucket)
-        return fetch_result.data.decode("utf-8")
+        output_path = task.temp_files[1]
+        if not output_path.exists():
+            raise ValueError("Output file not found.")
+
+        return output_path.read_text(encoding="utf-8")
+
+    def acknowledge_task(self, task_id: str) -> None:
+        """Acknowledge receipt of the transcription output.
+
+        After acknowledgment, all temporary files associated with the task
+        are deleted.
+
+        Parameters
+        ----------
+        task_id:
+            The task ID returned by ``upload_audio()``.
+
+        Raises
+        ------
+        KeyError:
+            If the task doesn't exist.
+        ValueError:
+            If the task hasn't completed yet or has already been acknowledged.
+        """
+        task = self._get_task(task_id)
+
+        if task.acknowledged:
+            raise ValueError("Task has already been acknowledged.")
+
+        if task.status != TaskStatus.COMPLETED:
+            raise ValueError(
+                f"Task is not completed (status: {task.status.value})."
+            )
+
+        # Delete all temporary files
+        for path in task.temp_files:
+            try:
+                if path.exists():
+                    path.unlink()
+                    logger.debug("Deleted temp file: %s", path)
+            except OSError as exc:
+                logger.warning("Failed to delete temp file %s: %s", path, exc)
+
+        task.temp_files.clear()
+        task.acknowledged = True
+        logger.info("Task %s acknowledged and temp files cleaned up", task_id)
 
     def cancel_task(self, task_id: str) -> TaskInfo:
-        """Cancel a running task.
+        """Cancel a running task and clean up temp files.
 
         Parameters
         ----------
@@ -560,8 +623,22 @@ class TranscriptionPipeline:
         task.status = TaskStatus.CANCELLED
         task.completed_at = datetime.now(timezone.utc)
 
+        # Clean up temp files
+        self._cleanup_temp_files(task)
+
         logger.info("Cancelled task %s", task_id)
         return task.to_info()
+
+    def _cleanup_temp_files(self, task: _ConversionTask) -> None:
+        """Delete all temporary files associated with a task."""
+        for path in task.temp_files:
+            try:
+                if path.exists():
+                    path.unlink()
+                    logger.debug("Deleted temp file: %s", path)
+            except OSError as exc:
+                logger.warning("Failed to delete temp file %s: %s", path, exc)
+        task.temp_files.clear()
 
     def list_tasks(self) -> list[TaskInfo]:
         """List all conversion tasks.

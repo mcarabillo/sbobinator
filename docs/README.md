@@ -34,12 +34,14 @@ basato su [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
 ### Cosa fa
 
-1. **Accetta** file audio (upload via API o già presenti su S3/MinIO)
-2. **Preprocessa** l'audio (decoding, mono, resampling, noise reduction, trimming)
-3. **Trascrive** con Whisper (batched o custom pipeline)
-4. **Formatta** l'output (SRT, VTT, TXT, CSV, TSV, JSON)
-5. **Salva** il risultato su S3/MinIO
-6. **Espone** un'API REST per controllare tutto il processo
+1. **Accetta** file audio via API REST (upload multipart)
+2. **Salva** il file in una cartella temporanea
+3. **Preprocessa** l'audio (decoding, mono, resampling, noise reduction, trimming)
+4. **Trascrive** con Whisper (batched o custom pipeline)
+5. **Formatta** l'output (SRT, VTT, TXT, CSV, TSV, JSON)
+6. **Salva** la trascrizione in un file temporaneo
+7. **Espone** l'output al chiamante via API
+8. **Cancella** i file temporanei dopo ACK del chiamante
 
 ### Tecnologie Principali
 
@@ -59,7 +61,6 @@ basato su [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
 - Python ≥ 3.14 (vedi `.python-version`)
 - GPU CUDA (per inference su GPU)
-- MinIO o S3 compatibile (per storage)
 - FFmpeg (per decoding mp3, m4a, webm)
 
 ---
@@ -134,10 +135,11 @@ sbobinator/
 │                              │                                   │
 │  ┌───────────────────────────▼─────────────────────────────────┐│
 │  │                    API Routes                                ││
-│  │  POST /api/audio/upload      → Upload file a S3/MinIO       ││
-│  │  POST /api/audio/convert     → Avvia trascrizione (async)   ││
+│  │  POST /api/audio/upload      → Upload file, avvia task      ││
+│  │  POST /api/audio/convert/{id}/format → Set output format    ││
 │  │  GET  /api/audio/convert/{id} → Poll status                 ││
 │  │  GET  /api/audio/convert/{id}/output → Download output      ││
+│  │  POST /api/audio/convert/{id}/ack → Ack + delete temp files ││
 │  │  DELETE /api/audio/convert/{id}  → Cancella task            ││
 │  │  GET  /api/audio/convert         → Lista tutti i task       ││
 │  └─────────────────────────────────────────────────────────────┘│
@@ -148,7 +150,7 @@ sbobinator/
 │           TranscriptionPipeline (Facade Singleton)               │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
 │  │ Audio    │  │ Audio    │  │ Whisper  │  │ Output       │   │
-│  │ Fetcher  │→ │Processor │→ │ Engine   │→ │ Formatter    │   │
+│  │Processor │→ │Processor │→ │ Engine   │→ │ Formatter    │   │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -162,8 +164,9 @@ sbobinator/
    sono inizializzati al primo utilizzo, non all'avvio.
 4. **Async Background Tasks**: La trascrizione avviene in background
    (FastAPI `BackgroundTasks`), l'API risponde immediatamente con un `task_id`.
-5. **S3-First**: Tutti i file (input e output) risiedono su S3/MinIO.
-6. **Configurabilità Totale**: Ogni parametro è configurabile via `.env.local`.
+5. **Temp-File Based**: I file temporanei (input e output) risiedono nel filesystem locale.
+6. **ACK-Based Cleanup**: I file vengono cancellati solo dopo ACK esplicito del chiamante.
+7. **Configurabilità Totale**: Ogni parametro è configurabile via `.env.local`.
 
 ---
 
@@ -175,32 +178,43 @@ sbobinator/
 
 | Metodo | Path | Descrizione |
 |---|---|---|
-| `POST` | `/api/audio/upload` | Upload file audio a S3/MinIO |
-| `POST` | `/api/audio/convert` | Avvia trascrizione (async) |
+| `POST` | `/api/audio/convert` | Upload file + avvia trascrizione (async) |
+| `POST` | `/api/audio/convert/{task_id}/format` | Imposta formato output |
 | `GET` | `/api/audio/convert/{task_id}` | Poll status del task |
 | `GET` | `/api/audio/convert/{task_id}/output` | Download output trascrizione |
+| `POST` | `/api/audio/convert/{task_id}/ack` | Ack + cancella file temporanei |
 | `DELETE` | `/api/audio/convert/{task_id}` | Cancella un task in corso |
 | `GET` | `/api/audio/convert` | Lista tutti i task |
 
 ### Modelli di Richiesta/Risposta
 
 ```python
-# POST /api/audio/convert — corpo della richiesta
-class ConvertRequest(BaseModel):
-    key: str              # S3 key del file audio (es. "audio/uploads/file.mp3")
-    bucket: str | None    # Override bucket (default: settings().storage.bucket)
-    output_format: str = "txt"  # Formato output (json, srt, vtt, txt, csv, tsv)
+# POST /api/audio/convert — risposta
+class ConvertTaskResponse(BaseModel):
+    task_id: str
+    status: str                  # "processing"
+    filename: str
+    content_type: str
+    size_bytes: int
+
+# POST /api/audio/convert/{task_id}/format — corpo della richiesta
+class ConvertFormatRequest(BaseModel):
+    output_format: str = "txt"   # Formato output (json, srt, vtt, txt, csv, tsv)
+
+# POST /api/audio/convert/{task_id}/ack — risposta
+class AckResponse(BaseModel):
+    acknowledged: bool
+    task_id: str
 
 # GET /api/audio/convert/{task_id} — risposta
 class TaskResponse(BaseModel):
     task_id: str
-    status: str                  # "pending" | "processing" | "completed" | "failed" | "cancelled"
-    key: str                     # S3 key originale
-    bucket: str
+    status: str                  # "processing" | "completed" | "failed" | "cancelled"
     progress: float              # 0.0 → 1.0
     started_at: str | None       # ISO timestamp
     completed_at: str | None     # ISO timestamp
-    output_key: str | None       # S3 key del file di output
+    filename: str | None         # Nome file originale
+    content_type: str | None     # MIME type
     duration: float | None       # Durata audio in secondi
     sample_rate: int | None      # Sample rate processato
     original_format: str | None  # Formato originale (mp3, wav, ecc.)
@@ -209,27 +223,29 @@ class TaskResponse(BaseModel):
     segment_count: int | None    # Numero di segmenti
     processing_time_ms: float | None
     error: str | None            # Messaggio di errore (se fallito)
+    acknowledged: bool           # True se output già consumato
 ```
 
 ### Come Funziona `POST /api/audio/convert`
 
 ```
-1. Riceve payload con key (S3 path)
-2. Chama _pipeline.start_conversion(key, bucket, output_format)
-   → Valida che il file esista su S3
+1. Riceve file audio (multipart/form-data)
+2. Chama _pipeline.upload_audio(file_bytes, content_type, filename)
+   → Crea un tempfile per l'audio sul disco
    → Crea un task con ID univoco
-   → Restituisce task_id
-3. Mette il task in coda per elaborazione background
-4. Restituisce TaskResponse con status="pending"
+   → Avvia process_task() in background thread
+   → Restituisce task_id immediatamente
+3. Restituisce ConvertTaskResponse con status="processing"
 ```
 
-### Come Funziona `GET /api/audio/convert/{task_id}/output`
+### Come Funziona `POST /api/audio/convert/{task_id}/ack`
 
 ```
-1. Controlla che il task esista e sia completato
-2. Recupera l'output_key dal task
-3. Fetch del file da S3/MinIO
-4. Restituisce il contenuto come Response (attachment)
+1. Controlla che il task esista e sia COMPLETED
+2. Controlla che non sia già stato ACKed
+3. Cancella tutti i tempfile associati al task
+4. Restituisce AckResponse con acknowledged=true
+5. Richieste successive a /output restituiranno 404
 ```
 
 ### File: `backend/api/__init__.py`
@@ -243,6 +259,10 @@ from backend.api.routes import router
 ---
 
 ## 5. Modulo Storage (`backend/modules/storage`)
+
+> **Nota**: Il modulo storage (S3/MinIO) è mantenuto per backward compatibility.
+> Il flusso principale di upload/trascrizione ora utilizza file temporanei
+> sul filesystem locale invece di S3.
 
 ### File: `backend/modules/storage/fetcher.py`
 
@@ -532,10 +552,13 @@ pipeline = TranscriptionPipeline.get_instance()  # Thread-safe
 ### Task Lifecycle
 
 ```
-PENDING → PROCESSING → COMPLETED
-                ↘ FAILED
-                ↘ CANCELLED
+PROCESSING → COMPLETED
+        ↘ FAILED
+        ↘ CANCELLED
 ```
+
+> **Nota**: Non esiste più lo stato PENDING. Il task parte subito in
+> stato PROCESSING all'upload.
 
 ### Classi
 
@@ -543,7 +566,6 @@ PENDING → PROCESSING → COMPLETED
 
 ```python
 class TaskStatus(str, Enum):
-    PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -557,12 +579,11 @@ class TaskStatus(str, Enum):
 class TaskInfo:
     task_id: str
     status: str
-    key: str
-    bucket: str
     progress: float
     started_at: datetime | None
     completed_at: datetime | None
-    output_key: str | None
+    filename: str | None           # Nome file originale
+    content_type: str | None       # MIME type
     duration: float | None
     sample_rate: int | None
     original_format: str | None
@@ -571,52 +592,65 @@ class TaskInfo:
     segment_count: int | None
     processing_time_ms: float | None
     error: str | None
+    acknowledged: bool             # True se output già consumato
 ```
 
 #### `_ConversionTask` (classe interna mutable)
 
-Stato mutabile del task, usato internamente. Contains `_cancelled` event
-per la cancellazione.
+Stato mutabile del task, usato internamente.
 
-#### `UploadResult` (dataclass frozen)
+**Attributi aggiuntivi:**
+- `temp_files: list[Path]` — Lista dei file temporanei (audio + output)
+- `acknowledged: bool` — True se l'output è stato ACKed
+
+#### `UploadTaskResult` (dataclass frozen)
 
 ```python
 @dataclass(frozen=True)
-class UploadResult:
-    key: str
-    bucket: str
-    size_bytes: int
+class UploadTaskResult:
+    task_id: str
+    status: str
+    filename: str
     content_type: str
-    uploaded_at: datetime
+    size_bytes: int
 ```
 
 ### Metodi Pubblici
 
 | Metodo | Descrizione |
 |---|---|
-| `upload_audio(file_bytes, content_type, bucket, destination)` | Upload file a S3 |
-| `start_conversion(key, bucket, output_format)` | Avvia task, restituisce task_id |
+| `upload_audio(file_bytes, content_type, filename)` | Salva audio in tempfile, avvia task, restituisce task_id |
+| `convert_task(task_id, output_format)` | Imposta formato output per un task |
 | `process_task(task_id)` | Esegue la pipeline completa (chiamato in background) |
 | `get_task_status(task_id)` → `TaskInfo` | Ottiene stato del task |
-| `get_task_output(task_id)` → `str` | Ottiene il contenuto dell'output |
-| `cancel_task(task_id)` → `TaskInfo` | Cancella un task |
+| `get_task_output(task_id)` → `str` | Ottiene il contenuto dell'output (da tempfile) |
+| `acknowledge_task(task_id)` | ACK output, cancella tempfile |
+| `cancel_task(task_id)` → `TaskInfo` | Cancella un task e i suoi tempfile |
 | `list_tasks()` → `list[TaskInfo]` | Lista tutti i task |
 
 ### Pipeline Interna (`process_task`)
 
 ```
-1. Fetch audio da S3/MinIO          → progress: 0.3
-2. Preprocess audio                 → progress: 0.6
-3. Transcribe con Whisper           → progress: 0.8
-4. Build output (raw o formatted)   → progress: 0.9
-5. Upload output a S3/MinIO
-6. Finalize task (status=COMPLETED) → progress: 1.0
+1. Leggi audio dal tempfile             → progress: 0.2
+2. Preprocess audio                     → progress: 0.4
+3. Transcribe con Whisper               → progress: 0.7
+4. Build output (raw o formatted)       → progress: 0.9
+5. Salva output in secondo tempfile
+6. Finalize task (status=COMPLETED)     → progress: 1.0
+```
+
+### Gestione File Temporanei
+
+```
+upload_audio() → Crea tempfile_audio
+process_task() → Crea tempfile_output
+get_task_output() → Legge tempfile_output (NON cancella)
+acknowledge_task() → Cancella tempfile_audio + tempfile_output
 ```
 
 ### Error Handling
 
 La pipeline cattura e gestisce:
-- `FetchError` → status=FAILED, error="Fetch error: ..."
 - `AudioProcessingError` → status=FAILED, error="Processing error: ..."
 - `TranscriptionError` → status=FAILED, error="Transcription error: ..."
 - `ValueError` → status=FAILED, error="Format error: ..."
@@ -666,6 +700,8 @@ Settings (main)
 │   ├── sample_rate, chunk_duration, max_duration
 │   ├── noise_reduction, noise_reduction_sample_rate
 │   ├── noise_reduction_frame_length
+├── temp: TempConfig
+│   ├── dir, cleanup_on_ack
 ├── output: OutputConfig
 │   ├── format, use_formatter, include_metadata
 │   ├── save_transcripts, transcripts_dir
@@ -674,8 +710,7 @@ Settings (main)
 └── storage: S3StorageConfig
     ├── endpoint_url, access_key_id, secret_access_key
     ├── bucket, region, secure, max_retries, timeout
-    ├── max_audio_size, upload_transcripts
-    ├── transcripts_bucket, transcripts_prefix
+    ├── max_audio_size
 ```
 
 ### Accessi alla Config
@@ -776,7 +811,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ## 12. Flusso dei Dati Completo
 
-### Scenario: Upload + Convert
+### Scenario: Upload → Convert → Output → Ack
 
 ```
 ┌──────────┐     POST /api/audio/upload      ┌─────────────┐
@@ -785,52 +820,79 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 └──────────┘                                 └──────┬──────┘
                                                     │
                                                     ▼
-┌─────────────┐    UploadResult    ┌───────────────────────────┐
-│   S3/MinIO  │ ←──────────────── │  TranscriptionPipeline    │
-│             │                    │  .upload_audio()          │
-└─────────────┘                    └───────────────────────────┘
-
-┌──────────┐     POST /api/audio/convert     ┌─────────────┐
-│  Client  │ ──────────────────────────────→ │  FastAPI    │
-│          │                                 │  (routes.py)│
-└──────────┘                                 └──────┬──────┘
-                                                    │
-                                                    ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    TranscriptionPipeline                        │
 │                                                                 │
-│  1. start_conversion(key, bucket, output_format)                │
-│     → Crea task, restituisce task_id                            │
+│  1. upload_audio(file_bytes, content_type, filename)            │
+│     → Crea tempfile audio sul disco                             │
+│     → Crea task con status=PROCESSING                           │
+│     → Avvia process_task() in background thread                 │
+│     → Restituisce task_id immediatamente                        │
 │                                                                 │
 │  2. process_task(task_id) [background thread]                   │
 │     ┌─────────────────────────────────────────────────────┐     │
-│     │ a. Fetch audio da S3/MinIO                           │     │
-│     │    AudioFetcher.fetch(key, bucket)                   │     │
-│     │                                                      │     │
-│     │ b. Preprocess audio                                  │     │
+│     │ a. Leggi audio dal tempfile                           │     │
 │     │    AudioProcessor.process(raw_bytes, content_type)   │     │
 │     │    → ProcessedAudio(data, sr, duration, ...)         │     │
 │     │                                                      │     │
-│     │ c. Transcribe                                        │     │
+│     │ b. Transcribe                                        │     │
 │     │    TranscriptionEngine.transcribe(audio_data, sr)    │     │
 │     │    → TranscriptionResult(segments, text, ...)        │     │
 │     │                                                      │     │
-│     │ d. Build output                                      │     │
+│     │ c. Build output                                      │     │
 │     │    Se use_formatter=True:                            │     │
 │     │      OutputFormatter.format(segments, fmt)           │     │
 │     │    Altrimenti:                                       │     │
 │     │      result.text (raw)                               │     │
 │     │                                                      │     │
-│     │ e. Upload output a S3/MinIO                          │     │
-│     │    AudioFetcher.upload(output_key, content, mime)    │     │
+│     │ d. Salva output in tempfile sul disco                │     │
 │     └─────────────────────────────────────────────────────┘     │
 │                                                                 │
 │  3. get_task_status(task_id) → TaskInfo                         │
 │                                                                 │
 │  4. get_task_output(task_id) → str                              │
-│     → Fetch output da S3/MinIO e decodifica                    │
+│     → Legge output dal tempfile (NON cancella)                 │
+│                                                                 │
+│  5. acknowledge_task(task_id)                                   │
+│     → Cancella tutti i tempfile del task                       │
+│     → Richieste successive a /output → 404                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Diagramma del Ciclo di Vita
+
+```
+POST /upload
+    │
+    ├──▶ [tempfile audio creato]
+    ├──▶ [task_id restituito, status=processing]
+    ├──▶ [background: process_task inizia]
+    │
+    │    GET /convert/{id}  → status=processing
+    │    GET /convert/{id}  → status=completed
+    │
+    ├──▶ [tempfile output creato]
+    │
+    GET /convert/{id}/output
+    │       │
+    │       ├──▶ [output restituito, file NON cancellati]
+    │       │
+    │       POST /convert/{id}/ack
+    │               │
+    │               ├──▶ [tutti i tempfile cancellati]
+    │               │
+    │               └──▶ [output restituito → 404]
+```
+
+### Gestione File Temporanei
+
+| Fase | File Audio | File Output |
+|---|---|---|
+| Upload | Creato | — |
+| Processing | Letto | — |
+| Completato | Letto | Creato |
+| Output scaricato | Letto | Letto |
+| ACK | **Cancellato** | **Cancellato** |
 
 ---
 
@@ -900,11 +962,15 @@ SBO_OUTPUT__USE_FORMATTER=False      # False = raw text, True = formatted
 SBO_OUTPUT__SAVE_TRANSCRIPTS=True
 SBO_OUTPUT__TRANSCRIPTS_DIR=./transcripts
 
+# Temporary Files
+SBO_TEMP__DIR=/tmp/sbobinator
+SBO_TEMP__CLEANUP_ON_ACK=True
+
 # Logging
 SBO_LOGGING__LEVEL=INFO
 SBO_LOGGING__FORMAT=json
 
-# S3/MinIO Storage
+# S3/MinIO Storage (kept for backward compatibility)
 SBO_STORAGE__ENDPOINT_URL=http://localhost:9000
 SBO_STORAGE__ACCESS_KEY_ID=minioadmin
 SBO_STORAGE__SECRET_ACCESS_KEY=minioadmin
@@ -912,9 +978,6 @@ SBO_STORAGE__BUCKET=sbobinator
 SBO_STORAGE__REGION=us-east-1
 SBO_STORAGE__SECURE=False
 SBO_STORAGE__MAX_AUDIO_SIZE=2147483648
-SBO_STORAGE__UPLOAD_TRANSCRIPTS=True
-SBO_STORAGE__TRANSCRIPTS_BUCKET=sbobinator-transcripts
-SBO_STORAGE__TRANSCRIPTS_PREFIX=transcripts/
 ```
 
 ---
@@ -987,8 +1050,9 @@ def _fetcher(self) -> AudioFetcher:
 | Endpoint REST | `backend/api/routes.py` |
 | Configurazione | `utils/config.py` |
 | Upload audio | `backend/api/routes.py::upload_audio()` |
-| Avvio conversione | `backend/transcription_pipeline.py::start_conversion()` |
+| ACK output | `backend/api/routes.py::acknowledge_output()` |
 | Pipeline completa | `backend/transcription_pipeline.py::process_task()` |
+| Acknowledge | `backend/transcription_pipeline.py::acknowledge_task()` |
 | Preprocessing audio | `backend/modules/preprocessing/audio_processor.py` |
 | Trascrizione batched | `backend/modules/transcription/batched_pipeline.py` |
 | Trascrizione custom | `backend/modules/transcription/custom_pipeline.py` |
@@ -1004,7 +1068,7 @@ def _fetcher(self) -> AudioFetcher:
 |---|---|
 | `FastAPI` | `fastapi` |
 | `uvicorn` | `uvicorn` |
-| `boto3` | `boto3` |
+| `boto3` | `boto3` (storage S3, opzionale) |
 | `WhisperModel`, `BatchedInferencePipeline` | `faster_whisper` |
 | `np` | `numpy` |
 | `sf` | `soundfile` |
@@ -1043,7 +1107,6 @@ uv sync --upgrade
 main.py
   └── backend/api/routes.py
         └── backend/transcription_pipeline.py
-              ├── backend/modules/storage/fetcher.py
               ├── backend/modules/preprocessing/audio_processor.py
               ├── backend/modules/transcription/whisper_engine.py
               │     ├── backend/modules/transcription/batched_pipeline.py
@@ -1051,6 +1114,7 @@ main.py
               └── backend/modules/output/formatter.py
                     └── backend/modules/transcription/batched_pipeline.py
                           (TranscriptionSegment, TranscriptionResult)
+              └── backend/modules/storage/fetcher.py  (opzionale, backward compat)
 
 utils/config.py
   └── (dipende da pydantic, pydantic_settings)
@@ -1059,16 +1123,26 @@ utils/config.py
 ## Appendice B: Stati del Task
 
 ```
-┌─────────┐     POST /convert     ┌────────────┐
-│ PENDING │──────────────────────→│ PROCESSING │
-└─────────┘                      └──────┬─────┘
-                                        │
-                    ┌───────────────────┼───────────────────┐
-                    │                   │                   │
-                    ▼                   ▼                   ▼
-            ┌───────────┐      ┌─────────────┐    ┌─────────────┐
-            │ COMPLETED │      │   FAILED    │    │ CANCELLED   │
-            └───────────┘      └─────────────┘    └─────────────┘
+POST /upload
+    │
+    ▼
+┌────────────┐
+│ PROCESSING │───────────────────────────────────────┐
+└──────┬─────┘                                       │
+       │                                             │
+       │ (successo)                                  │ (errore)
+       ▼                                             ▼
+┌─────────────┐                            ┌─────────────┐
+│ COMPLETED   │                            │   FAILED    │
+└──────┬──────┘                            └─────────────┘
+       │
+       │ POST /convert/{id}/ack
+       ▼
+┌─────────────┐
+│ ACKED*      │
+└─────────────┘
+
+* ACK è uno stato logico (flag `acknowledged`), non un task state enum.
 ```
 
 ## Appendice C: Formati di Output
@@ -1118,4 +1192,4 @@ start,end,text
 ---
 
 *Ultimo aggiornamento: 2025-07-28*
-*Versione documento: 1.1*
+*Versione documento: 2.0*

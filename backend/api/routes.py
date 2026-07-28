@@ -1,15 +1,13 @@
-"""API routes for audio upload and conversion.
+"""API routes for audio upload and transcription.
 
 Endpoints:
-  - POST   /api/audio/upload              → Upload a file to MinIO/S3
-  - POST   /api/audio/convert             → Start async transcription (returns task_id)
+  - POST   /api/audio/convert             → Upload file, start transcription (async)
+  - POST   /api/audio/convert/{task_id}/format → Set output format
   - GET    /api/audio/convert/{task_id}   → Poll conversion status
-  - GET    /api/audio/convert/{task_id}/output → Download generated transcription file
+  - GET    /api/audio/convert/{task_id}/output → Download transcription
+  - POST   /api/audio/convert/{task_id}/ack → Acknowledge receipt, delete temp files
   - DELETE /api/audio/convert/{task_id}   → Cancel a running task
-
-The transcription output is always plain text (raw transcription) by default.
-Set ``SBO_OUTPUT__USE_FORMATTER=true`` in the environment to use
-``OutputFormatter`` for formatted output (SRT, VTT, JSON, CSV, TSV).
+  - GET    /api/audio/convert             → List all tasks
 
 Facade
 ------
@@ -21,8 +19,10 @@ single point of entry for any transcription operation.
 from __future__ import annotations
 
 import logging
+import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -44,27 +44,28 @@ _pipeline = TranscriptionPipeline.get_instance()
 # ---------------------------------------------------------------------------
 
 
-class UploadResponse(BaseModel):
-    """Response after a successful upload."""
+class ConvertTaskResponse(BaseModel):
+    """Response after a successful audio upload (task created)."""
 
-    key: str
-    bucket: str
-    size_bytes: int
+    task_id: str
+    status: str
+    filename: str
     content_type: str
-    uploaded_at: str
+    size_bytes: int
 
 
-class ConvertRequest(BaseModel):
-    """Payload for the convert endpoint."""
-
-    key: str
-    """S3/MinIO object key (e.g. ``'audio/uploads/file.mp3'``)."""
-    bucket: str | None = None
-    """Override the default bucket."""
+class ConvertFormatRequest(BaseModel):
+    """Payload to set the output format for an existing task."""
 
     output_format: str = "txt"
-    """Ignored when ``use_formatter`` is False. When True, the output
-    format (``json``, ``srt``, ``vtt``, ``txt``, ``csv``, ``tsv``)."""
+    """Output format (``json``, ``srt``, ``vtt``, ``txt``, ``csv``, ``tsv``)."""
+
+
+class AckResponse(BaseModel):
+    """Response after acknowledging receipt of the transcription."""
+
+    acknowledged: bool
+    task_id: str
 
 
 class TaskResponse(BaseModel):
@@ -76,13 +77,11 @@ class TaskResponse(BaseModel):
 
     task_id: str
     status: str
-    key: str
-    bucket: str
     progress: float
     started_at: str | None = None
     completed_at: str | None = None
-    output_key: str | None = None
-    """S3 key of the generated transcription file."""
+    filename: str | None = None
+    content_type: str | None = None
     duration: float | None = None
     sample_rate: int | None = None
     original_format: str | None = None
@@ -91,6 +90,7 @@ class TaskResponse(BaseModel):
     segment_count: int | None = None
     processing_time_ms: float | None = None
     error: str | None = None
+    acknowledged: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -98,22 +98,23 @@ class TaskResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_audio(
-    file: UploadFile = File(...),
-    bucket: str | None = Form(None),
-    destination: str | None = Form(None),
-) -> UploadResponse:
-    """Upload an audio file to MinIO/S3.
+@router.post("/convert", response_model=ConvertTaskResponse)
+async def convert(file: UploadFile = File(...)) -> ConvertTaskResponse:
+    """Upload an audio file and start transcription.
+
+    The transcription runs asynchronously in a background thread.
+    The caller receives a ``task_id`` immediately and can poll for status
+    or download the output once completed.
 
     Parameters
     ----------
     file:
         Audio file to upload.
-    bucket:
-        Target bucket (defaults to config).
-    destination:
-        Custom key inside the bucket. Auto-generated if not provided.
+
+    Returns
+    -------
+    ConvertTaskResponse
+        The ``task_id`` and metadata about the upload.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
@@ -127,60 +128,55 @@ async def upload_audio(
         result = _pipeline.upload_audio(
             file_bytes=raw_data,
             content_type=content_type,
-            bucket=bucket,
-            destination=destination,
+            filename=file.filename,
         )
     except Exception as exc:
         logger.error("Upload failed for %s: %s", file.filename, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    logger.info("Uploaded %s → s3://%s/%s (%d bytes)", file.filename, result.bucket, result.key, len(raw_data))
+    logger.info("Uploaded %s → task=%s (%d bytes)", file.filename, result.task_id, len(raw_data))
 
-    return UploadResponse(
-        key=result.key,
-        bucket=result.bucket,
-        size_bytes=result.size_bytes,
+    return ConvertTaskResponse(
+        task_id=result.task_id,
+        status=result.status,
+        filename=result.filename,
         content_type=result.content_type,
-        uploaded_at=result.uploaded_at.isoformat(),
+        size_bytes=result.size_bytes,
     )
 
 
-@router.post("/convert", response_model=TaskResponse, status_code=202)
-async def convert_audio(
-    payload: ConvertRequest,
-    background_tasks: BackgroundTasks,
+@router.post("/convert/{task_id}/format", response_model=TaskResponse)
+async def set_convert_format(
+    task_id: str,
+    payload: ConvertFormatRequest,
 ) -> TaskResponse:
-    """Start an async transcription job.
+    """Set the output format for an existing upload task.
 
-    Returns a ``task_id`` immediately. Use the **status endpoint** to poll
-    for completion. Use the **output endpoint** to download the generated file.
+    Must be called before the transcription completes (or quickly after).
 
     Parameters
     ----------
+    task_id:
+        The task ID returned by the ``/convert`` endpoint.
     payload:
-        Object containing ``key`` (S3 path) and optional ``bucket``.
-    background_tasks:
-        FastAPI background task handler.
+        Contains ``output_format`` (json, srt, vtt, txt, csv, tsv).
+
+    Returns
+    -------
+    TaskResponse
+        Updated task state.
     """
-    # Validate and start conversion via facade
     try:
-        task_id = _pipeline.start_conversion(
-            key=payload.key,
-            bucket=payload.bucket,
+        _pipeline.convert_task(
+            task_id=task_id,
             output_format=payload.output_format,
         )
-    except HTTPException:
-        raise
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     except Exception as exc:
-        logger.error("Conversion start failed for %s: %s", payload.key, exc)
-        raise HTTPException(status_code=500, detail=f"Failed to start conversion: {exc}")
+        logger.error("Format update failed for %s: %s", task_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    # Queue background processing
-    background_tasks.add_task(_pipeline.process_task, task_id)
-
-    logger.info("Started conversion task %s for %s", task_id, payload.key)
-
-    # Return current status
     info = _pipeline.get_task_status(task_id)
     return TaskResponse(**_task_info_to_dict(info))
 
@@ -212,7 +208,7 @@ async def get_conversion_status(task_id: str) -> TaskResponse:
 
 @router.get("/convert/{task_id}/output")
 async def download_output(task_id: str) -> Response:
-    """Download the generated transcription file.
+    """Download the generated transcription.
 
     Parameters
     ----------
@@ -222,7 +218,7 @@ async def download_output(task_id: str) -> Response:
     Returns
     -------
     Response
-        The transcription file (plain text or formatted, depending on config).
+        The transcription content.
 
     Raises
     ------
@@ -238,20 +234,66 @@ async def download_output(task_id: str) -> Response:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # Determine filename from the output_key stored in the task
+    # Determine mime type from content
     try:
         info = _pipeline.get_task_status(task_id)
-        filename = info.output_key.split("/")[-1] if info.output_key else "transcription.txt"
+        # Try to detect format from filename or default to txt
+        if info.filename:
+            ext = Path(info.filename).suffix.lower()
+            mime_map = {
+                ".json": "application/json",
+                ".srt": "text/srt",
+                ".vtt": "text/vtt",
+                ".csv": "text/csv",
+                ".tsv": "text/tab-separated-values",
+            }
+            mime_type = mime_map.get(ext, "text/plain")
+        else:
+            mime_type = "text/plain"
     except KeyError:
-        filename = "transcription.txt"
+        mime_type = "text/plain"
 
     return Response(
         content=output,
-        media_type="text/plain",
+        media_type=mime_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": 'attachment; filename="transcription"',
         },
     )
+
+
+@router.post("/convert/{task_id}/ack", response_model=AckResponse)
+async def acknowledge_output(task_id: str) -> AckResponse:
+    """Acknowledge receipt of the transcription output.
+
+    After acknowledgment, all temporary files associated with the task
+    are deleted. Subsequent calls to the output endpoint will return 404.
+
+    Parameters
+    ----------
+    task_id:
+        The task ID returned by the ``/convert`` endpoint.
+
+    Returns
+    -------
+    AckResponse
+        Confirmation that the task has been acknowledged.
+
+    Raises
+    ------
+    HTTPException 404:
+        If the task doesn't exist.
+    HTTPException 400:
+        If the task hasn't completed yet or has already been acknowledged.
+    """
+    try:
+        _pipeline.acknowledge_task(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return AckResponse(acknowledged=True, task_id=task_id)
 
 
 @router.delete("/convert/{task_id}", response_model=TaskResponse)
@@ -293,14 +335,14 @@ def _task_info_to_dict(info) -> dict:
     data = {
         "task_id": info.task_id,
         "status": info.status,
-        "key": info.key,
-        "bucket": info.bucket,
         "progress": info.progress,
         "started_at": info.started_at.isoformat() if info.started_at else None,
         "completed_at": info.completed_at.isoformat() if info.completed_at else None,
+        "acknowledged": info.acknowledged,
     }
-    if info.output_key:
-        data["output_key"] = info.output_key
+    if info.filename:
+        data["filename"] = info.filename
+        data["content_type"] = info.content_type
         data["duration"] = info.duration
         data["sample_rate"] = info.sample_rate
         data["original_format"] = info.original_format

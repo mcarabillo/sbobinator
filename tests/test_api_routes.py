@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 from datetime import datetime, UTC
 
 import numpy as np
@@ -44,7 +44,6 @@ def mock_pipeline():
 @pytest.fixture()
 def app(mock_pipeline):
     """Return the FastAPI app with the pipeline mocked at import time."""
-    # Patch the module-level _pipeline variable directly
     with patch("backend.api.routes._pipeline", mock_pipeline):
         from main import create_app
         yield create_app()
@@ -57,83 +56,131 @@ def client(app, mock_pipeline):
 
 
 # ---------------------------------------------------------------------------
-# POST /api/audio/upload
+# POST /api/audio/convert (upload + start)
 # ---------------------------------------------------------------------------
 
 
-class TestUploadEndpoint:
-    def test_upload_success(self, client, mock_pipeline):
-        """Test successful audio upload."""
+class TestConvertUploadEndpoint:
+    def test_convert_upload_success(self, client, mock_pipeline):
+        """Test successful audio upload via /convert returns task_id."""
         mock_result = MagicMock()
-        mock_result.key = "audio/uploads/abc123.wav"
-        mock_result.bucket = "sbobinator"
-        mock_result.size_bytes = 32000
+        mock_result.task_id = "task_abc123"
+        mock_result.status = "processing"
+        mock_result.filename = "test.wav"
         mock_result.content_type = "audio/wav"
-        mock_result.uploaded_at = MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00")
+        mock_result.size_bytes = 32000
         mock_pipeline.upload_audio.return_value = mock_result
 
         response = client.post(
-            "/api/audio/upload",
+            "/api/audio/convert",
             files={"file": ("test.wav", io.BytesIO(_wav_file_bytes()), "audio/wav")},
         )
 
         assert response.status_code == 200
         data = response.json()
-        assert data["key"] == "audio/uploads/abc123.wav"
-        assert data["bucket"] == "sbobinator"
-        assert data["size_bytes"] == 32000
+        assert data["task_id"] == "task_abc123"
+        assert data["status"] == "processing"
+        assert data["filename"] == "test.wav"
         assert data["content_type"] == "audio/wav"
+        assert data["size_bytes"] == 32000
 
-    def test_upload_with_bucket_and_destination(self, client, mock_pipeline):
-        """Test upload with custom bucket and destination."""
+    def test_convert_upload_mp3(self, client, mock_pipeline):
+        """Test upload with MP3 content type."""
         mock_result = MagicMock()
-        mock_result.key = "custom-bucket/my-recording.wav"
-        mock_result.bucket = "custom-bucket"
-        mock_result.size_bytes = 1000
-        mock_result.content_type = "audio/wav"
-        mock_result.uploaded_at = MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00")
+        mock_result.task_id = "task_mp3_001"
+        mock_result.status = "processing"
+        mock_result.filename = "podcast.mp3"
+        mock_result.content_type = "audio/mpeg"
+        mock_result.size_bytes = 128000
         mock_pipeline.upload_audio.return_value = mock_result
 
         response = client.post(
-            "/api/audio/upload",
-            files={"file": ("test.wav", io.BytesIO(_wav_file_bytes()), "audio/wav")},
-            data={"bucket": "custom-bucket", "destination": "my-recording.wav"},
+            "/api/audio/convert",
+            files={"file": ("podcast.mp3", io.BytesIO(_wav_file_bytes()), "audio/mpeg")},
         )
 
         assert response.status_code == 200
-        mock_pipeline.upload_audio.assert_called_once()
-        call_kwargs = mock_pipeline.upload_audio.call_args
-        assert call_kwargs.kwargs["bucket"] == "custom-bucket"
-        assert call_kwargs.kwargs["destination"] == "my-recording.wav"
+        data = response.json()
+        assert data["task_id"] == "task_mp3_001"
+        assert data["filename"] == "podcast.mp3"
 
-    def test_upload_missing_filename(self, client, mock_pipeline):
-        """Test upload with missing filename returns 422 (validation error).
-
-        FastAPI validates the UploadFile before our route code runs,
-        so an empty filename results in a 422 Unprocessable Entity.
-        """
+    def test_convert_upload_missing_filename(self, client, mock_pipeline):
+        """Test upload with missing filename returns 422 (FastAPI validation)."""
         response = client.post(
-            "/api/audio/upload",
+            "/api/audio/convert",
             files={"file": ("", io.BytesIO(_wav_file_bytes()), "audio/wav")},
         )
 
         assert response.status_code == 422
 
-    def test_upload_failure(self, client, mock_pipeline):
+    def test_convert_upload_failure(self, client, mock_pipeline):
         """Test upload failure returns 500."""
-        mock_pipeline.upload_audio.side_effect = Exception("S3 error")
+        mock_pipeline.upload_audio.side_effect = Exception("Processing error")
 
         response = client.post(
-            "/api/audio/upload",
+            "/api/audio/convert",
             files={"file": ("test.wav", io.BytesIO(_wav_file_bytes()), "audio/wav")},
         )
 
         assert response.status_code == 500
-        assert "S3 error" in response.json()["detail"]
+        assert "Processing error" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
-# POST /api/audio/convert
+# POST /api/audio/convert/{task_id}/format
+# ---------------------------------------------------------------------------
+
+
+class TestSetConvertFormat:
+    def test_set_format_success(self, client, mock_pipeline):
+        """Test setting output format returns 200."""
+        mock_info = MagicMock()
+        mock_info.task_id = "task123"
+        mock_info.status = "processing"
+        mock_info.progress = 0.1
+        mock_info.started_at = None
+        mock_info.completed_at = None
+        mock_info.filename = "test.wav"
+        mock_info.content_type = "audio/wav"
+        mock_info.duration = None
+        mock_info.sample_rate = None
+        mock_info.original_format = None
+        mock_info.original_sample_rate = None
+        mock_info.language = None
+        mock_info.segment_count = None
+        mock_info.processing_time_ms = None
+        mock_info.error = None
+        mock_info.acknowledged = False
+
+        mock_pipeline.convert_task.return_value = "task123"
+        mock_pipeline.get_task_status.return_value = mock_info
+
+        response = client.post(
+            "/api/audio/convert/task123/format",
+            json={"output_format": "json"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["task_id"] == "task123"
+        mock_pipeline.convert_task.assert_called_once_with(
+            task_id="task123", output_format="json"
+        )
+
+    def test_set_format_not_found(self, client, mock_pipeline):
+        """Test setting format for non-existent task returns 404."""
+        mock_pipeline.convert_task.side_effect = KeyError("Task not found")
+
+        response = client.post(
+            "/api/audio/convert/nonexistent/format",
+            json={"output_format": "srt"},
+        )
+
+        assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /api/audio/convert/{task_id}
 # ---------------------------------------------------------------------------
 
 
@@ -142,12 +189,11 @@ def _make_task_info(task_id="task123", status="pending", **kwargs):
     info = MagicMock()
     info.task_id = task_id
     info.status = status
-    info.key = "audio/uploads/test.wav"
-    info.bucket = "sbobinator"
     info.progress = 0.0
     info.started_at = None
     info.completed_at = None
-    info.output_key = None
+    info.filename = "audio/uploads/test.wav"
+    info.content_type = "audio/wav"
     info.duration = None
     info.sample_rate = None
     info.original_format = None
@@ -156,74 +202,21 @@ def _make_task_info(task_id="task123", status="pending", **kwargs):
     info.segment_count = None
     info.processing_time_ms = None
     info.error = None
+    info.acknowledged = False
     for k, v in kwargs.items():
         setattr(info, k, v)
     return info
 
 
-class TestConvertEndpoint:
-    def test_convert_success(self, client, mock_pipeline):
-        """Test starting a conversion job returns 202 with task_id."""
-        mock_pipeline.start_conversion.return_value = "abc123def456"
-        mock_pipeline.get_task_status.return_value = _make_task_info(
-            task_id="abc123def456", status="pending"
-        )
-
-        response = client.post(
-            "/api/audio/convert",
-            json={"key": "audio/uploads/test.wav", "bucket": "sbobinator", "output_format": "txt"},
-        )
-
-        assert response.status_code == 202
-        data = response.json()
-        assert data["task_id"] == "abc123def456"
-        assert data["status"] == "pending"
-
-    def test_convert_minimal_payload(self, client, mock_pipeline):
-        """Test convert with minimal payload (only key required)."""
-        mock_pipeline.start_conversion.return_value = "task123"
-        mock_pipeline.get_task_status.return_value = _make_task_info(
-            task_id="task123", status="pending"
-        )
-
-        response = client.post(
-            "/api/audio/convert",
-            json={"key": "audio/uploads/test.wav"},
-        )
-
-        assert response.status_code == 202
-        data = response.json()
-        assert data["task_id"] == "task123"
-
-    def test_convert_failure(self, client, mock_pipeline):
-        """Test convert start failure returns 500."""
-        mock_pipeline.start_conversion.side_effect = Exception("File not found")
-
-        response = client.post(
-            "/api/audio/convert",
-            json={"key": "audio/uploads/missing.wav"},
-        )
-
-        assert response.status_code == 500
-        assert "Failed to start conversion" in response.json()["detail"]
-
-
-# ---------------------------------------------------------------------------
-# GET /api/audio/convert/{task_id}
-# ---------------------------------------------------------------------------
-
-
 class TestGetConversionStatus:
     def test_status_completed(self, client, mock_pipeline):
         """Test getting status of a completed task."""
-
         mock_info = _make_task_info(
             task_id="task123",
             status="completed",
             progress=1.0,
             started_at=datetime(2024, 1, 1, tzinfo=UTC),
             completed_at=datetime(2024, 1, 1, tzinfo=UTC),
-            output_key="audio/test.txt",
             duration=10.5,
             sample_rate=16000,
             original_format="wav",
@@ -245,30 +238,32 @@ class TestGetConversionStatus:
         assert data["language"] == "it"
         assert data["segment_count"] == 5
         assert data["processing_time_ms"] == 3200.0
+        assert "key" not in data
+        assert "bucket" not in data
+        assert "output_key" not in data
 
     def test_status_pending(self, client, mock_pipeline):
         """Test getting status of a pending task."""
         mock_pipeline.get_task_status.return_value = _make_task_info(
-            task_id="task456", status="pending", progress=0.0
+            task_id="task456", status="processing", progress=0.3
         )
 
         response = client.get("/api/audio/convert/task456")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "pending"
-        assert data["progress"] == 0.0
+        assert data["status"] == "processing"
+        assert data["progress"] == 0.3
 
     def test_status_failed(self, client, mock_pipeline):
         """Test getting status of a failed task."""
-
         mock_info = _make_task_info(
             task_id="task789",
             status="failed",
             progress=0.3,
             started_at=datetime(2024, 1, 1, tzinfo=UTC),
             completed_at=datetime(2024, 1, 1, tzinfo=UTC),
-            error="Fetch error: Object not found",
+            error="Processing error: Invalid audio format",
         )
         mock_pipeline.get_task_status.return_value = mock_info
 
@@ -277,7 +272,7 @@ class TestGetConversionStatus:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "failed"
-        assert data["error"] == "Fetch error: Object not found"
+        assert data["error"] == "Processing error: Invalid audio format"
 
     def test_status_not_found(self, client, mock_pipeline):
         """Test getting status of non-existent task returns 404."""
@@ -300,7 +295,7 @@ class TestDownloadOutput:
         mock_pipeline.get_task_status.return_value = _make_task_info(
             task_id="task123",
             status="completed",
-            output_key="audio/test.txt",
+            filename="test.wav",
         )
 
         response = client.get("/api/audio/convert/task123/output")
@@ -311,10 +306,7 @@ class TestDownloadOutput:
 
     def test_output_not_completed(self, client, mock_pipeline):
         """Test downloading output of a non-completed task returns 400."""
-        mock_pipeline.get_task_output.side_effect = ValueError("Task is not completed (status: pending).")
-        mock_pipeline.get_task_status.return_value = _make_task_info(
-            task_id="task123", status="pending"
-        )
+        mock_pipeline.get_task_output.side_effect = ValueError("Task is not completed (status: processing).")
 
         response = client.get("/api/audio/convert/task123/output")
 
@@ -330,6 +322,51 @@ class TestDownloadOutput:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/audio/convert/{task_id}/ack
+# ---------------------------------------------------------------------------
+
+
+class TestAcknowledgeOutput:
+    def test_ack_success(self, client, mock_pipeline):
+        """Test acknowledging output returns 200."""
+        mock_pipeline.acknowledge_task.return_value = None
+
+        response = client.post("/api/audio/convert/task123/ack")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["acknowledged"] is True
+        assert data["task_id"] == "task123"
+        mock_pipeline.acknowledge_task.assert_called_once_with("task123")
+
+    def test_ack_not_found(self, client, mock_pipeline):
+        """Test ACK for non-existent task returns 404."""
+        mock_pipeline.acknowledge_task.side_effect = KeyError("Task not found")
+
+        response = client.post("/api/audio/convert/nonexistent/ack")
+
+        assert response.status_code == 404
+
+    def test_ack_already_acked(self, client, mock_pipeline):
+        """Test double ACK returns 400."""
+        mock_pipeline.acknowledge_task.side_effect = ValueError("Task has already been acknowledged.")
+
+        response = client.post("/api/audio/convert/task123/ack")
+
+        assert response.status_code == 400
+        assert "already been acknowledged" in response.json()["detail"]
+
+    def test_ack_not_completed(self, client, mock_pipeline):
+        """Test ACK for non-completed task returns 400."""
+        mock_pipeline.acknowledge_task.side_effect = ValueError("Task is not completed (status: processing).")
+
+        response = client.post("/api/audio/convert/task123/ack")
+
+        assert response.status_code == 400
+        assert "not completed" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # DELETE /api/audio/convert/{task_id}
 # ---------------------------------------------------------------------------
 
@@ -337,7 +374,6 @@ class TestDownloadOutput:
 class TestCancelConversion:
     def test_cancel_success(self, client, mock_pipeline):
         """Test cancelling a running task."""
-
         mock_info = _make_task_info(
             task_id="task123",
             status="cancelled",
@@ -379,14 +415,12 @@ class TestListConversions:
 
     def test_list_multiple_tasks(self, client, mock_pipeline):
         """Test listing multiple tasks."""
-
         task1 = _make_task_info(
             task_id="task1",
             status="completed",
             progress=1.0,
             started_at=datetime(2024, 1, 1, tzinfo=UTC),
             completed_at=datetime(2024, 1, 1, tzinfo=UTC),
-            output_key="audio/test1.txt",
             duration=5.0,
             sample_rate=16000,
             original_format="wav",
@@ -397,8 +431,8 @@ class TestListConversions:
         )
         task2 = _make_task_info(
             task_id="task2",
-            status="pending",
-            progress=0.0,
+            status="processing",
+            progress=0.3,
         )
 
         mock_pipeline.list_tasks.return_value = [task1, task2]
@@ -411,7 +445,10 @@ class TestListConversions:
         assert data[0]["task_id"] == "task1"
         assert data[0]["status"] == "completed"
         assert data[1]["task_id"] == "task2"
-        assert data[1]["status"] == "pending"
+        assert data[1]["status"] == "processing"
+        # Verify no S3 fields
+        assert "key" not in data[0]
+        assert "bucket" not in data[0]
 
 
 # ---------------------------------------------------------------------------
@@ -423,62 +460,61 @@ class TestCORS:
     def test_cors_headers_present(self, client):
         """Test that CORS headers are present when CORS is configured."""
         response = client.options(
-            "/api/audio/upload",
+            "/api/audio/convert",
             headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST"},
         )
         assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
-# Integration: full upload → convert → poll → download flow
+# Integration: full upload → status → output → ack flow
 # ---------------------------------------------------------------------------
 
 
 class TestFullFlow:
-    """Test the full HTTP flow: upload → convert → poll → download."""
+    """Test the full HTTP flow: upload → status → output → ack."""
 
     def test_full_flow_mocked(self, client, mock_pipeline):
         """Simulate the full flow with mocked pipeline."""
 
-        # 1. Upload
+        # 1. Upload via /convert
         mock_upload_result = MagicMock()
-        mock_upload_result.key = "audio/uploads/integration_test.wav"
-        mock_upload_result.bucket = "sbobinator"
-        mock_upload_result.size_bytes = 32000
+        mock_upload_result.task_id = "integration_task_123"
+        mock_upload_result.status = "processing"
+        mock_upload_result.filename = "integration_test.wav"
         mock_upload_result.content_type = "audio/wav"
-        mock_upload_result.uploaded_at = MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00")
+        mock_upload_result.size_bytes = 32000
         mock_pipeline.upload_audio.return_value = mock_upload_result
 
         upload_resp = client.post(
-            "/api/audio/upload",
+            "/api/audio/convert",
             files={"file": ("integration_test.wav", io.BytesIO(_wav_file_bytes()), "audio/wav")},
         )
         assert upload_resp.status_code == 200
-        upload_key = upload_resp.json()["key"]
+        task_id = upload_resp.json()["task_id"]
+        assert task_id == "integration_task_123"
 
-        # 2. Convert (start)
-        mock_pipeline.start_conversion.return_value = "integration_task_123"
+        # 2. Poll status (processing)
         mock_pipeline.get_task_status.return_value = _make_task_info(
-            task_id="integration_task_123",
-            status="pending",
-            key=upload_key,
+            task_id=task_id,
+            status="processing",
+            progress=0.3,
+            started_at=datetime(2024, 1, 1, tzinfo=UTC),
         )
 
-        convert_resp = client.post(
-            "/api/audio/convert",
-            json={"key": upload_key, "output_format": "txt"},
-        )
-        assert convert_resp.status_code == 202
-        task_id = convert_resp.json()["task_id"]
+        status_resp = client.get(f"/api/audio/convert/{task_id}")
+        assert status_resp.status_code == 200
+        assert status_resp.json()["status"] == "processing"
+        assert "key" not in status_resp.json()
+        assert "bucket" not in status_resp.json()
 
-        # 3. Poll status (simulate completed)
+        # 3. Poll status (completed)
         mock_pipeline.get_task_status.return_value = _make_task_info(
             task_id=task_id,
             status="completed",
             progress=1.0,
             started_at=datetime(2024, 1, 1, tzinfo=UTC),
             completed_at=datetime(2024, 1, 1, tzinfo=UTC),
-            output_key="audio/test.txt",
             duration=1.0,
             sample_rate=16000,
             original_format="wav",
@@ -498,8 +534,25 @@ class TestFullFlow:
         assert output_resp.status_code == 200
         assert "Ciao mondo" in output_resp.text
 
-        # 5. List all tasks
+        # 5. Acknowledge
+        mock_pipeline.acknowledge_task.return_value = None
+        ack_resp = client.post(f"/api/audio/convert/{task_id}/ack")
+        assert ack_resp.status_code == 200
+        assert ack_resp.json()["acknowledged"] is True
+
+        # 6. Output after ACK should fail
+        mock_pipeline.get_task_output.side_effect = ValueError("Output file not found.")
+        output_resp_after = client.get(f"/api/audio/convert/{task_id}/output")
+        assert output_resp_after.status_code == 400
+
+        # 7. List all tasks
         mock_pipeline.list_tasks.return_value = [mock_pipeline.get_task_status.return_value]
         list_resp = client.get("/api/audio/convert")
         assert list_resp.status_code == 200
         assert len(list_resp.json()) == 1
+
+        # Verify no S3 fields in list response
+        for task_data in list_resp.json():
+            assert "key" not in task_data
+            assert "bucket" not in task_data
+            assert "output_key" not in task_data
