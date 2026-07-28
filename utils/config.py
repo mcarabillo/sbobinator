@@ -90,6 +90,10 @@ class OutputConfig(BaseModel):
     format: Literal["json", "srt", "vtt", "txt", "csv", "tsv"] = Field(
         default="json", description="Default output format"
     )
+    use_formatter: bool = Field(
+        default=False,
+        description="Use OutputFormatter for formatted output. When False, returns raw transcription text.",
+    )
     include_metadata: bool = Field(default=True, description="Include metadata in response")
     save_transcripts: bool = Field(default=True, description="Save transcripts to disk")
     transcripts_dir: Path = Field(
