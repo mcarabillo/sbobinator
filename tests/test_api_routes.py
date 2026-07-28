@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import io
 from unittest.mock import MagicMock, patch
+from datetime import datetime, UTC
 
 import numpy as np
 import pytest
 import soundfile as sf
+
 from fastapi.testclient import TestClient
 
 
@@ -214,14 +216,13 @@ class TestConvertEndpoint:
 class TestGetConversionStatus:
     def test_status_completed(self, client, mock_pipeline):
         """Test getting status of a completed task."""
-        from datetime import datetime, timezone
 
         mock_info = _make_task_info(
             task_id="task123",
             status="completed",
             progress=1.0,
-            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            completed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            started_at=datetime(2024, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2024, 1, 1, tzinfo=UTC),
             output_key="audio/test.txt",
             duration=10.5,
             sample_rate=16000,
@@ -260,14 +261,13 @@ class TestGetConversionStatus:
 
     def test_status_failed(self, client, mock_pipeline):
         """Test getting status of a failed task."""
-        from datetime import datetime, timezone
 
         mock_info = _make_task_info(
             task_id="task789",
             status="failed",
             progress=0.3,
-            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            completed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            started_at=datetime(2024, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2024, 1, 1, tzinfo=UTC),
             error="Fetch error: Object not found",
         )
         mock_pipeline.get_task_status.return_value = mock_info
@@ -337,14 +337,13 @@ class TestDownloadOutput:
 class TestCancelConversion:
     def test_cancel_success(self, client, mock_pipeline):
         """Test cancelling a running task."""
-        from datetime import datetime, timezone
 
         mock_info = _make_task_info(
             task_id="task123",
             status="cancelled",
             progress=0.5,
-            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            completed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            started_at=datetime(2024, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2024, 1, 1, tzinfo=UTC),
         )
         mock_pipeline.cancel_task.return_value = mock_info
 
@@ -380,14 +379,13 @@ class TestListConversions:
 
     def test_list_multiple_tasks(self, client, mock_pipeline):
         """Test listing multiple tasks."""
-        from datetime import datetime, timezone
 
         task1 = _make_task_info(
             task_id="task1",
             status="completed",
             progress=1.0,
-            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            completed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            started_at=datetime(2024, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2024, 1, 1, tzinfo=UTC),
             output_key="audio/test1.txt",
             duration=5.0,
             sample_rate=16000,
@@ -441,7 +439,6 @@ class TestFullFlow:
 
     def test_full_flow_mocked(self, client, mock_pipeline):
         """Simulate the full flow with mocked pipeline."""
-        from datetime import datetime, timezone
 
         # 1. Upload
         mock_upload_result = MagicMock()
@@ -479,8 +476,8 @@ class TestFullFlow:
             task_id=task_id,
             status="completed",
             progress=1.0,
-            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            completed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            started_at=datetime(2024, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2024, 1, 1, tzinfo=UTC),
             output_key="audio/test.txt",
             duration=1.0,
             sample_rate=16000,

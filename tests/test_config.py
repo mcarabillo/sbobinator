@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
-from utils.config import Settings, settings, get_settings
+from utils.config import (
+    LoggingConfig,
+    OutputConfig,
+    S3StorageConfig,
+    Settings,
+    WhisperConstraintsConfig,
+    WhisperInferenceConfig,
+    WhisperVadConfig,
+    get_settings,
+    settings,
+)
 
 
 class TestSettingsDefaults:
@@ -89,11 +97,11 @@ class TestSettingsValidators:
         assert s.whisper_language == "it"
 
     def test_model_path_none(self):
-        s = Settings(whisper_model_path="")
+        s = Settings(whisper_model_path="") # type: ignore[arg-type]
         assert s.whisper_model_path is None
 
     def test_model_path_resolved(self):
-        s = Settings(whisper_model_path="/tmp/model")
+        s = Settings(whisper_model_path="/tmp/model")  # type: ignore[arg-type]
         assert isinstance(s.whisper_model_path, Path)
         assert s.whisper_model_path.is_absolute()
 
@@ -112,7 +120,9 @@ class TestSettingsProperties:
 
         # Test with custom values via nested model
         s2 = Settings(
-            whisper_vad={"threshold": 0.6, "min_silence_duration_ms": 800, "speech_pad_ms": 300}
+            whisper_vad=WhisperVadConfig(
+                threshold=0.6, min_silence_duration_ms=800, speech_pad_ms=300
+            )
         )
         params2 = s2.vad_params
         assert params2["threshold"] == 0.6
@@ -120,13 +130,13 @@ class TestSettingsProperties:
         assert params2["speech_pad_ms"] == 300
 
     def test_whisper_kwargs_no_path(self):
-        s = Settings(whisper_model_path="")
+        s = Settings(whisper_model_path="") # type: ignore[arg-type]
         kwargs = s.whisper_kwargs
         assert kwargs["device"] == "cuda"
         assert "model_path" not in kwargs
 
     def test_whisper_kwargs_with_path(self):
-        s = Settings(whisper_model_path="/tmp/my-model")
+        s = Settings(whisper_model_path="/tmp/my-model")  # type: ignore[arg-type]
         kwargs = s.whisper_kwargs
         assert kwargs["model_path"] == Path("/tmp/my-model").resolve()
 
@@ -141,9 +151,11 @@ class TestSettingsProperties:
 
         # Test with custom values
         s2 = Settings(
-            whisper_inference={"beam_size": 3, "patience": 0.8, "temperature": 0.5},
-            whisper_constraints={"repetition_penalty": 1.2},
-            whisper_vad={"enabled": False},
+            whisper_inference=WhisperInferenceConfig(
+                beam_size=3, patience=0.8, temperature=0.5
+            ),
+            whisper_constraints=WhisperConstraintsConfig(repetition_penalty=1.2),
+            whisper_vad=WhisperVadConfig(enabled=False),
         )
         kwargs2 = s2.run_kwargs
         assert kwargs2["beam_size"] == 3
@@ -153,15 +165,15 @@ class TestSettingsProperties:
         assert kwargs2["vad_filter"] is False
 
     def test_storage_endpoint_http(self):
-        s = Settings(storage={"endpoint_url": "localhost:9000", "secure": False})
+        s = Settings(storage=S3StorageConfig(endpoint_url="localhost:9000", secure=False))
         assert s.storage_endpoint == "http://localhost:9000"
 
     def test_storage_endpoint_https(self):
-        s = Settings(storage={"endpoint_url": "s3.example.com", "secure": True})
+        s = Settings(storage=S3StorageConfig(endpoint_url="s3.example.com", secure=True))
         assert s.storage_endpoint == "https://s3.example.com"
 
     def test_storage_endpoint_already_has_scheme(self):
-        s = Settings(storage={"endpoint_url": "https://s3.example.com"})
+        s = Settings(storage=S3StorageConfig(endpoint_url="https://s3.example.com"))
         assert s.storage_endpoint == "https://s3.example.com"
 
 
@@ -231,28 +243,28 @@ class TestSettingsValidation:
 
     def test_beam_size_out_of_range(self):
         with pytest.raises(ValidationError):
-            Settings(whisper_inference={"beam_size": 0})
+            Settings(whisper_inference=WhisperInferenceConfig(beam_size=0))
 
     def test_beam_size_too_high(self):
         with pytest.raises(ValidationError):
-            Settings(whisper_inference={"beam_size": 21})
+            Settings(whisper_inference=WhisperInferenceConfig(beam_size=21))
 
     def test_temperature_out_of_range(self):
         with pytest.raises(ValidationError):
-            Settings(whisper_inference={"temperature": -0.1})
+            Settings(whisper_inference=WhisperInferenceConfig(temperature=-0.1))
 
     def test_temperature_too_high(self):
         with pytest.raises(ValidationError):
-            Settings(whisper_inference={"temperature": 1.1})
+            Settings(whisper_inference=WhisperInferenceConfig(temperature=1.1))
 
     def test_invalid_output_format(self):
         with pytest.raises(ValidationError):
-            Settings(output={"format": "xml"})
+            Settings(output=OutputConfig(format="xml"))  # type: ignore[arg-type]
 
     def test_invalid_vad_method(self):
         with pytest.raises(ValidationError):
-            Settings(whisper_vad={"method": "invalid"})
+            Settings(whisper_vad=WhisperVadConfig(method="invalid"))  # type: ignore[arg-type]
 
     def test_invalid_logging_level(self):
         with pytest.raises(ValidationError):
-            Settings(logging={"level": "VERBOSE"})
+            Settings(logging=LoggingConfig(level="VERBOSE"))  # type: ignore[arg-type]
