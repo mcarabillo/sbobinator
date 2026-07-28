@@ -5,8 +5,53 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "fastapi",
-    "ffmpeg-python",
-    "silero-vad",
-    "noisereduce",
+    "soundfile>=0.14.0",
+    "faster-whisper>=1.2.1",
+    "fastapi>=0.140.0",
+    "python-multipart>=0.0.9",
+    "ffmpeg-python>=0.2.0",
+    "noisereduce>=3.0.3",
+    "numpy>=2.5.1",
+    "scipy>=1.14.0",
+    "pydantic-settings>=2.14.2",
+    "boto3>=1.36.0",
+    "uvicorn>=0.51.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "coverage>=7.15.2",
+    "ruff>=0.16.0",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "nvidia-cudnn-cu12>=9.24.0.43",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["backend", "utils"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
 ]

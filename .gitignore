@@ -5,6 +5,25 @@ build/
 dist/
 wheels/
 *.egg-info
+.ruff_cache/
 
-# Virtual environments
+# (Virtual) environments
 .venv
+.env.*
+!.env.example
+
+# Pytest cache
+.pytest_cache/
+.cache/
+
+# Coverage.py / pytest-cov
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.lcov
+
+# Report ed esportazioni (xml, html, json)
+nosetests.xml
+pytest_report.html
+junit/*.xml
