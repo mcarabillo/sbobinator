@@ -135,7 +135,7 @@ sbobinator/
 │                              │                                   │
 │  ┌───────────────────────────▼─────────────────────────────────┐│
 │  │                    API Routes                                ││
-│  │  POST /api/audio/upload      → Upload file, avvia task      ││
+│  │  POST /api/audio/convert     → Upload file, avvia task      ││
 │  │  POST /api/audio/convert/{id}/format → Set output format    ││
 │  │  GET  /api/audio/convert/{id} → Poll status                 ││
 │  │  GET  /api/audio/convert/{id}/output → Download output      ││
@@ -814,7 +814,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ### Scenario: Upload → Convert → Output → Ack
 
 ```
-┌──────────┐     POST /api/audio/upload      ┌─────────────┐
+┌──────────┐     POST /api/audio/convert     ┌─────────────┐
 │  Client  │ ──────────────────────────────→ │  FastAPI    │
 │          │                                 │  (routes.py)│
 └──────────┘                                 └──────┬──────┘
@@ -862,7 +862,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ### Diagramma del Ciclo di Vita
 
 ```
-POST /upload
+POST /api/audio/convert
     │
     ├──▶ [tempfile audio creato]
     ├──▶ [task_id restituito, status=processing]
@@ -1049,7 +1049,7 @@ def _fetcher(self) -> AudioFetcher:
 |---|---|
 | Endpoint REST | `backend/api/routes.py` |
 | Configurazione | `utils/config.py` |
-| Upload audio | `backend/api/routes.py::upload_audio()` |
+| Upload audio | `backend/api/routes.py::convert()` |
 | ACK output | `backend/api/routes.py::acknowledge_output()` |
 | Pipeline completa | `backend/transcription_pipeline.py::process_task()` |
 | Acknowledge | `backend/transcription_pipeline.py::acknowledge_task()` |
@@ -1123,7 +1123,7 @@ utils/config.py
 ## Appendice B: Stati del Task
 
 ```
-POST /upload
+POST /api/audio/convert
     │
     ▼
 ┌────────────┐
